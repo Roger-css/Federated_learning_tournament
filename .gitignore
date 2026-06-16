@@ -27,7 +27,7 @@ datasets/
 *.csv
 *.npy
 *.npz
-
+fl_results.*
 # Flower server state / logs
 flower_logs/
 *.log
