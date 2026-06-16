@@ -167,7 +167,23 @@ class iTransformerGlobal(nn.Module):
                 if name in state and state[name].shape == val.shape:
                     state[name] = val
         self.load_state_dict(state)
+    def save_local_params(self, filepath):
+        """Saves the local, unshared positional embedding to a specific file."""
+        import torch
+        # Save explicitly as a dictionary
+        torch.save({"pos_embed": self.pos_embed.data.cpu()}, filepath)
 
+    def load_local_params(self, filepath):
+        """Loads the local positional embedding if the specific file exists."""
+        import torch
+        import os
+        # Ensure we are checking for a FILE, not a directory
+        if os.path.isfile(filepath):
+            local_state = torch.load(filepath, map_location="cpu", weights_only=True)
+            with torch.no_grad():
+                self.pos_embed.copy_(local_state["pos_embed"])
+            return True
+        return False
     def _make_loaders(self, X_tr, y_tr, X_te, y_te, batch_size):
         Xtr = torch.tensor(X_tr, dtype=torch.float32)
         ytr = torch.tensor(y_tr, dtype=torch.long)

@@ -32,6 +32,7 @@ from flwr.common import (
     parameters_to_ndarrays,
 )
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
+from flwr.simulation import start_simulation
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
@@ -92,7 +93,8 @@ class DHSVFedAvg(FedAvg):
         common_keys = set.intersection(
             *[set(p["weights"].keys()) for p, _ in payloads_with_n]
         )
-
+        print(f"\n[Aggregation] Common keys count: {len(common_keys)}")
+        print(f"[Aggregation] Keys excluded (not in all clients): {set.union(*[set(p['weights'].keys()) for p, _ in payloads_with_n]) - common_keys}")
         # --- Weighted average (matching shapes only) --------------------
         aggregated: Dict = {}
         for key in common_keys:
@@ -302,133 +304,27 @@ def main() -> None:
     print(f"  Results path : {RESULTS_PATH}")
     print("="*65 + "\n")
 
-    # Build all clients (raw FlowerClient, not wrapped by .to_client())
-    clients = [load_client(name) for name in CLIENT_MAP.values()]
+    def fit_config(server_round: int) -> Dict:
+        return {"local_epochs": LOCAL_EPOCHS}
 
-    # Initial global parameters from first client
-    global_params = clients[0].get_parameters(config={})
+    strategy = DHSVFedAvg(
+        fraction_fit          = 1.0,
+        fraction_evaluate     = 1.0,
+        min_fit_clients       = 4,
+        min_evaluate_clients  = 4,
+        min_available_clients = 4,
+        on_fit_config_fn      = fit_config,
+    )
 
-    # Track results per round
-    round_metrics: list = []
+    start_simulation(
+        client_fn         = client_fn,
+        num_clients       = len(CLIENT_MAP),
+        config            = ServerConfig(num_rounds=NUM_ROUNDS),
+        strategy          = strategy,
+        client_resources  = {"num_cpus": 1, "num_gpus": 0.25},
+    )
 
-    for server_round in range(1, NUM_ROUNDS + 1):
-        # ---- Fit phase ----
-        fit_results: list = []
-        for client in clients:
-            params, num_examples, metrics = client.fit(
-                global_params, {"local_epochs": LOCAL_EPOCHS}
-            )
-            fit_results.append((params, num_examples, metrics))
-
-        # ---- Aggregate (deserialize → weighted average → re-serialize) ----
-        payloads_with_n: list = []
-        for params, n, _ in fit_results:
-            arr = params[0]
-            payload = pickle.loads(bytes(arr.tobytes()))
-            payloads_with_n.append((payload, n))
-
-        total = sum(n for _, n in payloads_with_n)
-        common_keys = set.intersection(
-            *[set(p["weights"].keys()) for p, _ in payloads_with_n]
-        )
-
-        aggregated = {}
-        for key in common_keys:
-            shapes = [p["weights"][key].shape for p, _ in payloads_with_n]
-            if len(set(shapes)) == 1:
-                aggregated[key] = sum(
-                    p["weights"][key].cpu().clone().float() * (n / total)
-                    for p, n in payloads_with_n
-                )
-
-        agg_payload = {
-            "weights"     : aggregated,
-            "sensor_names": payloads_with_n[0][0]["sensor_names"],
-            "n_sensors"   : payloads_with_n[0][0]["n_sensors"],
-        }
-        global_params = [
-            np.frombuffer(pickle.dumps(agg_payload), dtype=np.uint8).copy()
-        ]
-
-        # ---- Log fit metrics ----
-        fit_m: Dict[str, Dict] = {}
-        for _, n, m in fit_results:
-            cid = m["client_id"]
-            fit_m[cid] = {
-                "train_f1": m["train_f1"],
-                "test_f1" : m["test_f1"],
-                "num_examples": n,
-            }
-
-        avg_f1 = sum(v["test_f1"] for v in fit_m.values()) / max(len(fit_m), 1)
-        print(f"\n{'='*65}")
-        print(f"  Round {server_round}/{NUM_ROUNDS} — Fit Results")
-        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10} {'Samples':>10}")
-        print(f"  {'─'*46}")
-        for cid, m in sorted(fit_m.items()):
-            print(
-                f"  {cid:<14} {m['train_f1']:>10.4f} "
-                f"{m['test_f1']:>10.4f} {m['num_examples']:>10,}"
-            )
-        print(f"  {'─'*46}")
-        print(f"  {'Avg test F1':<14} {avg_f1:>10.4f}")
-        print(f"{'='*65}")
-
-        # ---- Evaluate phase ----
-        eval_m: Dict[str, Dict] = {}
-        for client in clients:
-            loss, n, metrics = client.evaluate(global_params, {})
-            cid = metrics["client_id"]
-            eval_m[cid] = {
-                "test_f1"    : metrics["test_f1"],
-                "accuracy"   : metrics["accuracy"],
-                "num_examples": n,
-                "predictions": json.loads(metrics["predictions"]),
-                "confidences": json.loads(metrics["confidences"]),
-            }
-
-        print(f"\n{'='*65}")
-        print(f"  Round {server_round}/{NUM_ROUNDS} — Evaluate Results")
-        print(f"  {'Client':<14} {'Test F1':>10} {'Accuracy':>10} {'Samples':>10}")
-        print(f"  {'─'*46}")
-        for cid, m in sorted(eval_m.items()):
-            print(
-                f"  {cid:<14} {m['test_f1']:>10.4f} "
-                f"{m['accuracy']:>10.4f} {m['num_examples']:>10,}"
-            )
-        print(f"{'='*65}\n")
-
-        round_metrics.append({
-            "round"   : server_round,
-            "fit"     : fit_m,
-            "evaluate": eval_m,
-        })
-
-    # ---- Write final results ----
-    rounds_out = []
-    for entry in round_metrics:
-        fit  = entry.get("fit",      {})
-        eval = entry.get("evaluate", {})
-        all_cids = sorted(set(fit.keys()) | set(eval.keys()))
-        clients_out = []
-        for cid in all_cids:
-            fm = fit.get(cid,  {})
-            em = eval.get(cid, {})
-            clients_out.append({
-                "client_id"  : cid,
-                "train_f1"   : fm.get("train_f1",    0.0),
-                "test_f1"    : em.get("test_f1",     fm.get("test_f1", 0.0)),
-                "accuracy"   : em.get("accuracy",    0.0),
-                "num_examples": fm.get("num_examples", em.get("num_examples", 0)),
-                "predictions": em.get("predictions", []),
-                "confidences": em.get("confidences", []),
-            })
-        rounds_out.append({"round": entry["round"], "clients": clients_out})
-
-    os.makedirs(os.path.dirname(os.path.abspath(RESULTS_PATH)), exist_ok=True)
-    with open(RESULTS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"rounds": rounds_out}, f, indent=2)
-    print(f"Results written to: {RESULTS_PATH}")
+    strategy.write_results(RESULTS_PATH)
 
 
 if __name__ == "__main__":

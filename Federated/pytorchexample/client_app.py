@@ -14,6 +14,7 @@ tobytes() recovers the original byte sequence for pickle.loads().
 
 import json
 import pickle
+import time
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ from flwr.client import ClientApp, NumPyClient
 from config import CLIENT_MAP, DATA_DIR
 from task import DEVICE, iTransformerGlobal
 
-
+CLIENT_STATE_DIR = os.path.join(DATA_DIR, ".client_states")
 class FlowerClient(NumPyClient):
     """NumPyClient for a single oil-well client."""
 
@@ -63,6 +64,7 @@ class FlowerClient(NumPyClient):
         """Deserialize and load shared params into the model."""
         arr     = parameters[0]                    # uint8 ndarray from server
         payload = pickle.loads(bytes(arr.tobytes()))
+        print(f"[{self.client_id}] set_parameters: sensor_names={payload['sensor_names']}, keys={list(payload['weights'].keys())[:3]}...")
         self.model.load_shared_params(payload)
 
     # ------------------------------------------------------------------
@@ -72,8 +74,10 @@ class FlowerClient(NumPyClient):
     def fit(self, parameters, config):
         """Train for one FL round and return updated weights + metrics."""
         self.set_parameters(parameters)
+        print(f"[{self.client_id}] evaluate payload keys count: {len(pickle.loads(bytes(parameters[0].tobytes()))['weights'])}")
+        print(f"[{self.client_id}] model sensor_embed weight sum: {next(self.model.parameters()).sum().item():.4f}")
         local_epochs = int(config.get("local_epochs", 5))
-
+        
         best_res, _ = self.model.fit(
             self.X_train, self.y_train,
             self.X_test,  self.y_test,
@@ -81,7 +85,9 @@ class FlowerClient(NumPyClient):
             n_epochs     = local_epochs,
             use_early_stop = False,
         )
-
+        state_path = os.path.join(CLIENT_STATE_DIR, f"{self.client_id}_local.pt")
+        self.model.save_local_params(state_path)
+        print(f"[{self.client_id}][{time.time()}] SAVED pos_embed to {CLIENT_STATE_DIR}, file_size={os.path.getsize(CLIENT_STATE_DIR)}")
         metrics = {
             "train_f1":  float(best_res["train"]["f1"]), # type: ignore
             "test_f1":   float(best_res["test"]["f1"]), # type: ignore
@@ -96,7 +102,7 @@ class FlowerClient(NumPyClient):
     def evaluate(self, parameters, config):
         """Evaluate on the local test set and return metrics + predictions."""
         self.set_parameters(parameters)
-
+        print(f"[{self.client_id}] evaluate: model device={next(self.model.parameters()).device}")
         n          = len(self.X_test)
         batch_size = 64 if n > 20_000 else (32 if n > 5_000 else 16)
         Xte        = torch.tensor(self.X_test, dtype=torch.float32)
@@ -149,7 +155,7 @@ def client_fn(cid_or_context):
         cid = str(cid_or_context)
 
     client_name = CLIENT_MAP[cid]
-
+    
     # Load numpy arrays
     data    = np.load(os.path.join(DATA_DIR, f"{client_name}.npz"))
     X_train = data["X_train"]
@@ -165,7 +171,10 @@ def client_fn(cid_or_context):
     window_size = X_train.shape[1]
 
     model = iTransformerGlobal(sensor_names=sensor_names, window_size=window_size)
-
+    state_path = os.path.join(CLIENT_STATE_DIR, f"{client_name}_local.pt")
+    is_loaded = model.load_local_params(state_path)
+    print(f"[{client_name}] Local state load attempt | path={state_path} | Success={is_loaded}")
+    print(f"[{client_name}][{time.time()}] LOAD attempted: path={CLIENT_STATE_DIR}, exists={os.path.exists(CLIENT_STATE_DIR)}")
     return FlowerClient(
         model     = model,
         X_train   = X_train,
