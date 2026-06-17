@@ -21,6 +21,8 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import math
+
 import numpy as np
 
 from flwr.common import (
@@ -89,6 +91,14 @@ class DHSVFedAvg(FedAvg):
 
         total = sum(n for _, n in payloads_with_n)
 
+        # --- Log-scaled weights (reduce client_2's dominance) ----------
+        log_weights = [math.log(n + 1) for _, n in payloads_with_n]
+        log_total = sum(log_weights)
+        normalized_weights = [w / log_total for w in log_weights]
+
+        print(f"[Aggregation] Linear weights: {[n/total for _, n in payloads_with_n]}")
+        print(f"[Aggregation] Log-scaled weights: {normalized_weights}")
+
         # --- Find keys common to every client ---------------------------
         common_keys = set.intersection(
             *[set(p["weights"].keys()) for p, _ in payloads_with_n]
@@ -101,8 +111,8 @@ class DHSVFedAvg(FedAvg):
             shapes = [p["weights"][key].shape for p, _ in payloads_with_n]
             if len(set(shapes)) == 1:                      # shapes match
                 aggregated[key] = sum(
-                    p["weights"][key].cpu().clone().float() * (n / total)
-                    for p, n in payloads_with_n
+                    p["weights"][key].cpu().clone().float() * normalized_weights[i]
+                    for i, (p, n) in enumerate(payloads_with_n)
                 )
 
         # --- Build and serialize aggregated payload ---------------------
