@@ -1,6 +1,9 @@
-"""DHSV Fault Detection — Model Classes (verbatim from neural_network.ipynb).
+"""DHSV Fault Detection — Per-Sensor iTransformer Model.
 
-Do NOT modify any class in this file.
+Port of the per-sensor FL approach from Untitled74 (1).ipynb.
+Each sensor name gets its own position embedding (via ParameterDict),
+shared sensors are aggregated by name on the server, private sensors
+stay local.  The classifier head is per-client (local).
 """
 
 import copy
@@ -105,26 +108,43 @@ class EarlyStopping:
 
 
 # ---------------------------------------------------------------------------
-# iTransformerGlobal  — DO NOT MODIFY
+# iTransformerPerSensor  — per-sensor position embeddings + local classifier
 # ---------------------------------------------------------------------------
 
-class iTransformerGlobal(nn.Module):
+class iTransformerPerSensor(nn.Module):
+    """iTransformer with per-sensor positional embeddings (ParameterDict).
+
+    Each sensor *name* gets its own position embedding vector, enabling
+    the server to aggregate embeddings for shared sensors by name while
+    keeping private-sensor embeddings local.  The classifier head is also
+    kept local (per-client).
+    """
+
     def __init__(self, sensor_names, window_size, num_classes=3,
                  d_model=D_MODEL, n_heads=N_HEADS,
                  n_layers=N_LAYERS, dropout=DROPOUT):
         super().__init__()
         self.sensor_names = sensor_names
         self.n_sensors    = len(sensor_names)
+        self.d_model      = d_model
+
+        # Shared backbone
         self.sensor_embed = nn.Linear(window_size, d_model)
-        self.pos_embed    = nn.Parameter(
-            torch.randn(1, self.n_sensors, d_model) * 0.02
-        )
-        self.input_norm = nn.LayerNorm(d_model)
-        self.blocks     = nn.ModuleList([
+        self.input_norm   = nn.LayerNorm(d_model)
+
+        # Per-sensor position embeddings (keyed by sensor name, '-' → '_')
+        self.sensor_pos = nn.ParameterDict({
+            name.replace("-", "_"): nn.Parameter(torch.randn(d_model) * 0.02)
+            for name in sensor_names
+        })
+
+        self.blocks = nn.ModuleList([
             TransformerBlock(d_model, n_heads, dropout) for _ in range(n_layers)
         ])
-        self.out_norm   = nn.LayerNorm(d_model)
-        self.dropout    = nn.Dropout(dropout)
+        self.out_norm  = nn.LayerNorm(d_model)
+        self.dropout   = nn.Dropout(dropout)
+
+        # Local classifier head (kept per client)
         self.classifier = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
@@ -132,58 +152,109 @@ class iTransformerGlobal(nn.Module):
             nn.Linear(d_model // 2, num_classes),
         )
 
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
     def forward(self, x):
+        # x: (B, T, S) → (B, S, T)
         x = x.permute(0, 2, 1)
-        x = self.sensor_embed(x) + self.pos_embed
+        x = self.sensor_embed(x)                     # (B, S, d_model)
+
+        # Stack per-sensor position embeddings in sensor order
+        pos = torch.stack([
+            self.sensor_pos[n.replace("-", "_")]
+            for n in self.sensor_names
+        ], dim=0)                                    # (S, d_model)
+        x = x + pos.unsqueeze(0)                     # (B, S, d_model)
+
         x = self.input_norm(x)
         for blk in self.blocks:
             x = blk(x)
-        x = self.dropout(self.out_norm(x).mean(dim=1))
-        return self.classifier(x)
+        x = self.dropout(self.out_norm(x).mean(dim=1))   # (B, d_model)
+        return self.classifier(x)                         # (B, num_classes)
 
-    def get_shared_params(self):
+    # ------------------------------------------------------------------
+    # Payload for Flower — shared weights + per-sensor embeddings
+    # ------------------------------------------------------------------
+
+    def get_payload(self):
+        """Return dict with shared_weights + sensor_embeddings + sensor_names.
+
+        Shared weights exclude sensor_pos (per-sensor) and classifier (local).
+        """
         shared = {}
         for name, param in self.named_parameters():
-            if "pos_embed" not in name:
+            if "sensor_pos" not in name and "classifier" not in name:
                 shared[name] = param.data.clone()
-        payload = {
-            "weights"     : shared,
-            "sensor_names": self.sensor_names,
-            "n_sensors"   : self.n_sensors,
-        }
-        return payload
 
-    def load_shared_params(self, payload):
-        incoming_names   = payload["sensor_names"]
-        incoming_weights = payload["weights"]
-        state = self.state_dict()
-        for name, val in incoming_weights.items():
-            if name == "pos_embed":
-                for i, sensor in enumerate(self.sensor_names):
-                    if sensor in incoming_names:
-                        j = incoming_names.index(sensor)
-                        state["pos_embed"][0, i, :] = val[0, j, :]
-            else:
-                if name in state and state[name].shape == val.shape:
-                    state[name] = val
-        self.load_state_dict(state)
+        sensor_embeddings = {
+            sensor: self.sensor_pos[sensor.replace("-", "_")].data.clone()
+            for sensor in self.sensor_names
+        }
+
+        return {
+            "shared_weights"   : shared,
+            "sensor_embeddings": sensor_embeddings,
+            "sensor_names"     : self.sensor_names,
+        }
+
+    def load_global(self, payload):
+        """Load aggregated global params into the model.
+
+        Uses .data.copy_() on parameters directly (avoids state_dict
+        device-mismatch issues).
+        """
+        global_shared   = payload["shared_weights"]
+        global_sensor   = payload["sensor_embeddings"]
+
+        param_dict = dict(self.named_parameters())
+        for k, v in global_shared.items():
+            if k in param_dict and "sensor_pos" not in k and "classifier" not in k:
+                param_dict[k].data.copy_(v.to(device=param_dict[k].device))
+
+        for sensor in self.sensor_names:
+            key = sensor.replace("-", "_")
+            if sensor in global_sensor:
+                self.sensor_pos[key].data.copy_(
+                    global_sensor[sensor].to(device=self.sensor_pos[key].device)
+                )
+
+    # ------------------------------------------------------------------
+    # Local params (sensor_pos + classifier) persistence
+    # ------------------------------------------------------------------
+
     def save_local_params(self, filepath):
-        """Saves the local, unshared positional embedding to a specific file."""
-        import torch
-        # Save explicitly as a dictionary
-        torch.save({"pos_embed": self.pos_embed.data.cpu()}, filepath)
+        """Save per-client params: sensor_pos + classifier."""
+        sensor_pos_state = {
+            k: v.clone().cpu() for k, v in self.sensor_pos.items()
+        }
+        classifier_state = {
+            k: v.clone().cpu() for k, v in self.classifier.state_dict().items()
+        }
+        torch.save({
+            "sensor_pos" : sensor_pos_state,
+            "classifier" : classifier_state,
+        }, filepath)
 
     def load_local_params(self, filepath):
-        """Loads the local positional embedding if the specific file exists."""
-        import torch
+        """Restore per-client params: sensor_pos + classifier."""
         import os
-        # Ensure we are checking for a FILE, not a directory
         if os.path.isfile(filepath):
             local_state = torch.load(filepath, map_location="cpu", weights_only=True)
             with torch.no_grad():
-                self.pos_embed.copy_(local_state["pos_embed"])
+                if "sensor_pos" in local_state:
+                    for k, v in local_state["sensor_pos"].items():
+                        self.sensor_pos[k].copy_(v.to(device=self.sensor_pos[k].device))
+                if "classifier" in local_state:
+                    self.classifier.load_state_dict(local_state["classifier"])
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Data loaders & evaluation helpers
+    # ------------------------------------------------------------------
+
     def _make_loaders(self, X_tr, y_tr, X_te, y_te, batch_size):
         Xtr = torch.tensor(X_tr, dtype=torch.float32)
         ytr = torch.tensor(y_tr, dtype=torch.long)
@@ -196,9 +267,12 @@ class iTransformerGlobal(nn.Module):
             w_samp[ytr == cls] = w
         sampler   = WeightedRandomSampler(w_samp, len(ytr), replacement=True)
         class_w   = (w_cls / w_cls.sum()).to(DEVICE)
-        tr_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size, sampler=sampler, drop_last=True)
-        tr_eval   = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size, shuffle=False)
-        te_loader = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size, shuffle=False)
+        tr_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size,
+                               sampler=sampler, drop_last=True)
+        tr_eval   = DataLoader(TensorDataset(Xtr, ytr), batch_size=batch_size,
+                               shuffle=False)
+        te_loader = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size,
+                               shuffle=False)
         return tr_loader, tr_eval, te_loader, class_w
 
     @torch.no_grad()
@@ -218,6 +292,10 @@ class iTransformerGlobal(nn.Module):
             "preds"   : preds,
         }
 
+    # ------------------------------------------------------------------
+    # Local training
+    # ------------------------------------------------------------------
+
     def fit(self, X_train, y_train, X_test, y_test,
             client_id="client", n_epochs=None, use_early_stop=True):
         epochs_to_run = n_epochs if n_epochs is not None else EPOCHS
@@ -229,7 +307,8 @@ class iTransformerGlobal(nn.Module):
         )
         criterion  = FocalLoss(gamma=2.0, label_smoothing=0.05)
         optimizer  = AdamW(self.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-        scheduler  = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=8, min_lr=1e-6)
+        scheduler  = ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
+                                       patience=8, min_lr=1e-6)
         early_stop = EarlyStopping(patience=PATIENCE, min_delta=MIN_DELTA)
 
         best_f1, best_state, best_res = 0.0, None, None
