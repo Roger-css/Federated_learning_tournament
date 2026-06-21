@@ -27,7 +27,7 @@ import flwr as fl
 from flwr.client import ClientApp, NumPyClient
 
 from config import CLIENT_MAP, DATA_DIR
-from task import DEVICE, iTransformerGlobal
+from task import DEVICE, iTransformerPerSensor
 
 CLIENT_STATE_DIR = os.path.join(DATA_DIR, ".client_states")
 class FlowerClient(NumPyClient):
@@ -35,7 +35,7 @@ class FlowerClient(NumPyClient):
 
     def __init__(
         self,
-        model: iTransformerGlobal,
+        model: iTransformerPerSensor,
         X_train: np.ndarray,
         y_train: np.ndarray,
         X_test: np.ndarray,
@@ -55,17 +55,19 @@ class FlowerClient(NumPyClient):
 
     def get_parameters(self, config):
         """Serialize shared params as a single numpy uint8 array."""
-        payload    = self.model.get_shared_params()
+        payload    = self.model.get_payload()
         serialized = pickle.dumps(payload)
         arr        = np.frombuffer(serialized, dtype=np.uint8).copy()
         return [arr]
 
     def set_parameters(self, parameters):
-        """Deserialize and load shared params into the model."""
-        arr     = parameters[0]                    # uint8 ndarray from server
+        """Deserialize and load global (shared + sensor embeddings) into model."""
+        arr     = parameters[0]
         payload = pickle.loads(bytes(arr.tobytes()))
-        print(f"[{self.client_id}] set_parameters: sensor_names={payload['sensor_names']}, keys={list(payload['weights'].keys())[:3]}...")
-        self.model.load_shared_params(payload)
+        n_shared = len(payload["shared_weights"])
+        n_sensors = len(payload["sensor_embeddings"])
+        print(f"[{self.client_id}] set_parameters: shared={n_shared} keys, sensor_embeddings={n_sensors} sensors")
+        self.model.load_global(payload)
 
     # ------------------------------------------------------------------
     # Flower interface — fit
@@ -74,8 +76,8 @@ class FlowerClient(NumPyClient):
     def fit(self, parameters, config):
         """Train for one FL round and return updated weights + metrics."""
         self.set_parameters(parameters)
-        print(f"[{self.client_id}] evaluate payload keys count: {len(pickle.loads(bytes(parameters[0].tobytes()))['weights'])}")
-        print(f"[{self.client_id}] model sensor_embed weight sum: {next(self.model.parameters()).sum().item():.4f}")
+        shared_count = len(pickle.loads(bytes(parameters[0].tobytes()))["shared_weights"])
+        print(f"[{self.client_id}] evaluate payload shared keys count: {shared_count}")
         local_epochs = int(config.get("local_epochs", 5))
         
         best_res, _ = self.model.fit(
@@ -87,7 +89,7 @@ class FlowerClient(NumPyClient):
         )
         state_path = os.path.join(CLIENT_STATE_DIR, f"{self.client_id}_local.pt")
         self.model.save_local_params(state_path)
-        print(f"[{self.client_id}][{time.time()}] SAVED pos_embed to {CLIENT_STATE_DIR}, file_size={os.path.getsize(CLIENT_STATE_DIR)}")
+        print(f"[{self.client_id}][{time.time()}] SAVED local params to {state_path}")
         metrics = {
             "train_f1":  float(best_res["train"]["f1"]), # type: ignore
             "test_f1":   float(best_res["test"]["f1"]), # type: ignore
@@ -170,11 +172,11 @@ def client_fn(cid_or_context):
     # window_size is always X_train.shape[1] (16)
     window_size = X_train.shape[1]
 
-    model = iTransformerGlobal(sensor_names=sensor_names, window_size=window_size)
+    model = iTransformerPerSensor(sensor_names=sensor_names, window_size=window_size)
     state_path = os.path.join(CLIENT_STATE_DIR, f"{client_name}_local.pt")
     is_loaded = model.load_local_params(state_path)
     print(f"[{client_name}] Local state load attempt | path={state_path} | Success={is_loaded}")
-    print(f"[{client_name}][{time.time()}] LOAD attempted: path={CLIENT_STATE_DIR}, exists={os.path.exists(CLIENT_STATE_DIR)}")
+    print(f"[{client_name}][{time.time()}] LOAD attempted: path={state_path}, exists={os.path.exists(state_path)}")
     return FlowerClient(
         model     = model,
         X_train   = X_train,

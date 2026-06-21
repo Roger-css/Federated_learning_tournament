@@ -40,7 +40,7 @@ from flwr.server.strategy import FedAvg
 
 from client_app import FlowerClient, client_fn
 from config import CLIENT_MAP, DATA_DIR, LOCAL_EPOCHS, NUM_ROUNDS, RESULTS_PATH
-from task import DEVICE, iTransformerGlobal
+from task import DEVICE, iTransformerPerSensor
 
 # ---------------------------------------------------------------------------
 # Custom strategy
@@ -48,18 +48,17 @@ from task import DEVICE, iTransformerGlobal
 
 
 class DHSVFedAvg(FedAvg):
-    """FedAvg variant for heterogeneous sensor payloads.
+    """FedAvg with per-sensor position embedding aggregation.
 
     Each client transmits a pickled dict with:
-        weights      – shared model parameters (dict[str, Tensor])
-        sensor_names – ordered list of this client's sensor names
-        n_sensors    – number of sensors
+        shared_weights      – shared backbone parameters (dict[str, Tensor])
+        sensor_embeddings   – per-sensor position embeddings (dict[str, Tensor])
+        sensor_names        – ordered list of this client's sensor names
 
     Aggregation:
-    • Deserialize each client payload.
-    • Weighted average (by num_examples) for every key present in ALL
-      clients and with identical shapes.  pos_embed is never present
-      (model.get_shared_params() already excludes it).
+    • Log-scaled weighted average of shared_weights (keys common to all).
+    • Per-sensor weighted average of sensor_embeddings, grouped by sensor
+      name — each sensor is averaged only across clients that have it.
     • Re-serialize the aggregated payload and return as Parameters.
     """
 
@@ -99,27 +98,66 @@ class DHSVFedAvg(FedAvg):
         print(f"[Aggregation] Linear weights: {[n/total for _, n in payloads_with_n]}")
         print(f"[Aggregation] Log-scaled weights: {normalized_weights}")
 
-        # --- Find keys common to every client ---------------------------
-        common_keys = set.intersection(
-            *[set(p["weights"].keys()) for p, _ in payloads_with_n]
+        # ------------------------------------------------------------------
+        #  1. Aggregate shared_weights — keys common to ALL clients
+        # ------------------------------------------------------------------
+        all_shared_keys = set.union(
+            *[set(p["shared_weights"].keys()) for p, _ in payloads_with_n]
         )
-        print(f"\n[Aggregation] Common keys count: {len(common_keys)}")
-        print(f"[Aggregation] Keys excluded (not in all clients): {set.union(*[set(p['weights'].keys()) for p, _ in payloads_with_n]) - common_keys}")
-        # --- Weighted average (matching shapes only) --------------------
-        aggregated: Dict = {}
-        for key in common_keys:
-            shapes = [p["weights"][key].shape for p, _ in payloads_with_n]
-            if len(set(shapes)) == 1:                      # shapes match
-                aggregated[key] = sum(
-                    p["weights"][key].cpu().clone().float() * normalized_weights[i]
-                    for i, (p, n) in enumerate(payloads_with_n)
+        common_shared_keys = set.intersection(
+            *[set(p["shared_weights"].keys()) for p, _ in payloads_with_n]
+        )
+        # Confirm classifier keys are absent
+        classifier_keys = {k for k in all_shared_keys if "classifier" in k}
+        print(f"\n[Aggregation] Shared keys across clients: {len(all_shared_keys)}")
+        print(f"[Aggregation] Common shared keys: {len(common_shared_keys)}")
+        print(f"[Aggregation] Classifier keys in shared payload (should be 0): {len(classifier_keys)}")
+        if classifier_keys:
+            print(f"[Aggregation]   WARNING: unexpected classifier keys: {classifier_keys}")
+        print(f"[Aggregation] Excluded (not in all clients / shape mismatch): {all_shared_keys - common_shared_keys}")
+
+        aggregated_shared: Dict = {}
+        for key in common_shared_keys:
+            shapes = [p["shared_weights"][key].shape for p, _ in payloads_with_n]
+            if len(set(shapes)) == 1:
+                aggregated_shared[key] = sum(
+                    p["shared_weights"][key].cpu().clone().float() * normalized_weights[i]
+                    for i, (p, _) in enumerate(payloads_with_n)
                 )
 
-        # --- Build and serialize aggregated payload ---------------------
+        # ------------------------------------------------------------------
+        #  2. Aggregate sensor_embeddings — per-sensor, grouped by name
+        # ------------------------------------------------------------------
+        from collections import defaultdict
+        sensor_sums    = defaultdict(lambda: None)
+        sensor_weights = defaultdict(float)
+
+        for i, (p, _) in enumerate(payloads_with_n):
+            w = normalized_weights[i]
+            for sensor, embed in p["sensor_embeddings"].items():
+                embed_f = embed.cpu().clone().float()
+                if sensor_sums[sensor] is None:
+                    sensor_sums[sensor] = embed_f * w
+                else:
+                    sensor_sums[sensor] += embed_f * w
+                sensor_weights[sensor] += w
+
+        aggregated_sensor = {}
+        for sensor in sensor_sums:
+            if sensor_weights[sensor] > 0:
+                aggregated_sensor[sensor] = sensor_sums[sensor] / sensor_weights[sensor]
+            else:
+                aggregated_sensor[sensor] = sensor_sums[sensor]
+
+        print(f"[Aggregation] Sensors aggregated ({len(aggregated_sensor)}): "
+              f"{', '.join(sorted(aggregated_sensor.keys()))}")
+
+        # ------------------------------------------------------------------
+        #  3. Build and serialize aggregated payload
+        # ------------------------------------------------------------------
         agg_payload = {
-            "weights"     : aggregated,
-            "sensor_names": payloads_with_n[0][0]["sensor_names"],
-            "n_sensors"   : payloads_with_n[0][0]["n_sensors"],
+            "shared_weights"   : aggregated_shared,
+            "sensor_embeddings": aggregated_sensor,
         }
         agg_arr    = np.frombuffer(pickle.dumps(agg_payload), dtype=np.uint8).copy()
         parameters = ndarrays_to_parameters([agg_arr])
@@ -299,7 +337,7 @@ def load_client(name: str) -> FlowerClient:
     sensor_names = pd.read_csv(sensors_csv)["sensor_name"].tolist()
     window_size  = X_train.shape[1]
 
-    model = iTransformerGlobal(sensor_names=sensor_names, window_size=window_size).to(DEVICE)
+    model = iTransformerPerSensor(sensor_names=sensor_names, window_size=window_size).to(DEVICE)
     return FlowerClient(model, X_train, y_train, X_test, y_test, name)
 
 
