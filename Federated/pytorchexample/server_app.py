@@ -1,378 +1,349 @@
-"""DHSV Fault Detection — Flower Server: Strategy + Simulation entry point.
-
-Run from anywhere:
-    python -m pytorchexample.server_app
-or
-    python Federated/pytorchexample/server_app.py
-"""
-
 import json
 import os
-import pickle
 import sys
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict
 
-# ---------------------------------------------------------------------------
-# Force UTF-8 stdout/stderr so Windows cp1252 consoles don't choke on the
-# box-drawing characters (─, etc.) printed by model.fit().
-# ---------------------------------------------------------------------------
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import math
-
 import numpy as np
+import torch
 
-from flwr.common import (
-    Context,
-    EvaluateRes,
-    FitRes,
-    Parameters,
-    ndarrays_to_parameters,
-    parameters_to_ndarrays,
-)
+from flwr.common import Context
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
-from flwr.simulation import start_simulation
-from flwr.server.client_proxy import ClientProxy
-from flwr.server.strategy import FedAvg
 
-from client_app import FlowerClient, client_fn
-from config import CLIENT_MAP, DATA_DIR, LOCAL_EPOCHS, NUM_ROUNDS, RESULTS_PATH
-from task import DEVICE, iTransformerPerSensor
-
-# ---------------------------------------------------------------------------
-# Custom strategy
-# ---------------------------------------------------------------------------
-
-
-class DHSVFedAvg(FedAvg):
-    """FedAvg with per-sensor position embedding aggregation.
-
-    Each client transmits a pickled dict with:
-        shared_weights      – shared backbone parameters (dict[str, Tensor])
-        sensor_embeddings   – per-sensor position embeddings (dict[str, Tensor])
-        sensor_names        – ordered list of this client's sensor names
-
-    Aggregation:
-    • Log-scaled weighted average of shared_weights (keys common to all).
-    • Per-sensor weighted average of sensor_embeddings, grouped by sensor
-      name — each sensor is averaged only across clients that have it.
-    • Re-serialize the aggregated payload and return as Parameters.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._round_metrics: List[Dict] = []   # one entry per round
-        self._best_avg_f1: float = 0.0         # tracks global improvement
-
-    # ------------------------------------------------------------------
-    # aggregate_fit
-    # ------------------------------------------------------------------
-
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, FitRes]],
-        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
-    ) -> Tuple[Optional[Parameters], Dict]:
-
-        if not results:
-            return None, {}
-
-        # --- Deserialize each client payload ----------------------------
-        payloads_with_n: List[Tuple[Dict, int]] = []
-        for _, fit_res in results:
-            arr     = parameters_to_ndarrays(fit_res.parameters)[0]
-            payload = pickle.loads(bytes(arr.tobytes()))
-            payloads_with_n.append((payload, fit_res.num_examples))
-
-        total = sum(n for _, n in payloads_with_n)
-
-        # --- Log-scaled weights (reduce client_2's dominance) ----------
-        log_weights = [math.log(n + 1) for _, n in payloads_with_n]
-        log_total = sum(log_weights)
-        normalized_weights = [w / log_total for w in log_weights]
-
-        print(f"[Aggregation] Linear weights: {[n/total for _, n in payloads_with_n]}")
-        print(f"[Aggregation] Log-scaled weights: {normalized_weights}")
-
-        # ------------------------------------------------------------------
-        #  1. Aggregate shared_weights — keys common to ALL clients
-        # ------------------------------------------------------------------
-        all_shared_keys = set.union(
-            *[set(p["shared_weights"].keys()) for p, _ in payloads_with_n]
-        )
-        common_shared_keys = set.intersection(
-            *[set(p["shared_weights"].keys()) for p, _ in payloads_with_n]
-        )
-        # Confirm classifier keys are absent
-        classifier_keys = {k for k in all_shared_keys if "classifier" in k}
-        print(f"\n[Aggregation] Shared keys across clients: {len(all_shared_keys)}")
-        print(f"[Aggregation] Common shared keys: {len(common_shared_keys)}")
-        print(f"[Aggregation] Classifier keys in shared payload (should be 0): {len(classifier_keys)}")
-        if classifier_keys:
-            print(f"[Aggregation]   WARNING: unexpected classifier keys: {classifier_keys}")
-        print(f"[Aggregation] Excluded (not in all clients / shape mismatch): {all_shared_keys - common_shared_keys}")
-
-        aggregated_shared: Dict = {}
-        for key in common_shared_keys:
-            shapes = [p["shared_weights"][key].shape for p, _ in payloads_with_n]
-            if len(set(shapes)) == 1:
-                aggregated_shared[key] = sum(
-                    p["shared_weights"][key].cpu().clone().float() * normalized_weights[i]
-                    for i, (p, _) in enumerate(payloads_with_n)
-                )
-
-        # ------------------------------------------------------------------
-        #  2. Aggregate sensor_embeddings — per-sensor, grouped by name
-        # ------------------------------------------------------------------
-        from collections import defaultdict
-        sensor_sums    = defaultdict(lambda: None)
-        sensor_weights = defaultdict(float)
-
-        for i, (p, _) in enumerate(payloads_with_n):
-            w = normalized_weights[i]
-            for sensor, embed in p["sensor_embeddings"].items():
-                embed_f = embed.cpu().clone().float()
-                if sensor_sums[sensor] is None:
-                    sensor_sums[sensor] = embed_f * w
-                else:
-                    sensor_sums[sensor] += embed_f * w
-                sensor_weights[sensor] += w
-
-        aggregated_sensor = {}
-        for sensor in sensor_sums:
-            if sensor_weights[sensor] > 0:
-                aggregated_sensor[sensor] = sensor_sums[sensor] / sensor_weights[sensor]
-            else:
-                aggregated_sensor[sensor] = sensor_sums[sensor]
-
-        print(f"[Aggregation] Sensors aggregated ({len(aggregated_sensor)}): "
-              f"{', '.join(sorted(aggregated_sensor.keys()))}")
-
-        # ------------------------------------------------------------------
-        #  3. Build and serialize aggregated payload
-        # ------------------------------------------------------------------
-        agg_payload = {
-            "shared_weights"   : aggregated_shared,
-            "sensor_embeddings": aggregated_sensor,
-        }
-        agg_arr    = np.frombuffer(pickle.dumps(agg_payload), dtype=np.uint8).copy()
-        parameters = ndarrays_to_parameters([agg_arr])
-
-        # --- Collect fit metrics per client -----------------------------
-        fit_metrics: Dict[str, Dict] = {}
-        for _, fit_res in results:
-            m   = fit_res.metrics or {}
-            cid = m.get("client_id", "unknown")
-            fit_metrics[cid] = {
-                "train_f1"   : float(m.get("train_f1", 0.0)),
-                "test_f1"    : float(m.get("test_f1",  0.0)),
-                "num_examples": fit_res.num_examples,
-            }
-
-        # --- Console logging --------------------------------------------
-        avg_f1      = sum(v["test_f1"] for v in fit_metrics.values()) / max(len(fit_metrics), 1)
-        improvement = avg_f1 - self._best_avg_f1
-        self._best_avg_f1 = max(self._best_avg_f1, avg_f1)
-
-        print(f"\n{'='*65}")
-        print(f"  Round {server_round}/{NUM_ROUNDS} — Fit Results")
-        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10} {'Samples':>10}")
-        print(f"  {'─'*46}")
-        for cid, m in sorted(fit_metrics.items()):
-            print(
-                f"  {cid:<14} {m['train_f1']:>10.4f} "
-                f"{m['test_f1']:>10.4f} {m['num_examples']:>10,}"
-            )
-        print(f"  {'─'*46}")
-        print(f"  {'Avg test F1':<14} {avg_f1:>10.4f}   improvement: {improvement:+.4f}")
-        print(f"{'='*65}")
-
-        # --- Store for JSON output (evaluate will merge later) ----------
-        self._round_metrics.append({
-            "round"   : server_round,
-            "fit"     : fit_metrics,
-            "evaluate": {},
-        })
-
-        return parameters, {}
-
-    # ------------------------------------------------------------------
-    # aggregate_evaluate
-    # ------------------------------------------------------------------
-
-    def aggregate_evaluate(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, EvaluateRes]],
-        failures: List[Union[Tuple[ClientProxy, EvaluateRes], BaseException]],
-    ) -> Tuple[Optional[float], Dict]:
-
-        if not results:
-            return None, {}
-
-        # --- Collect evaluate metrics per client ------------------------
-        eval_metrics: Dict[str, Dict] = {}
-        for _, eval_res in results:
-            m           = eval_res.metrics or {}
-            cid         = m.get("client_id", "unknown")
-            raw_preds   = m.get("predictions", "[]")
-            raw_confs   = m.get("confidences", "[]")
-            eval_metrics[cid] = {
-                "test_f1"    : float(m.get("test_f1",  0.0)),
-                "accuracy"   : float(m.get("accuracy", 0.0)),
-                "num_examples": eval_res.num_examples,
-                "predictions": json.loads(raw_preds) if isinstance(raw_preds, str) else raw_preds,
-                "confidences": json.loads(raw_confs) if isinstance(raw_confs, str) else raw_confs,
-            }
-
-        # --- Merge into the matching round entry ------------------------
-        for entry in self._round_metrics:
-            if entry["round"] == server_round:
-                entry["evaluate"] = eval_metrics
-                break
-
-        try:
-            self.write_results(RESULTS_PATH)
-        except Exception as e:
-            print(f"Warning: Failed to auto-write results during round {server_round}: {e}")
-
-        # --- Console logging --------------------------------------------
-        print(f"\n{'='*65}")
-        print(f"  Round {server_round}/{NUM_ROUNDS} — Evaluate Results")
-        print(f"  {'Client':<14} {'Test F1':>10} {'Accuracy':>10} {'Samples':>10}")
-        print(f"  {'─'*46}")
-        for cid, m in sorted(eval_metrics.items()):
-            print(
-                f"  {cid:<14} {m['test_f1']:>10.4f} "
-                f"{m['accuracy']:>10.4f} {m['num_examples']:>10,}"
-            )
-        print(f"{'='*65}\n")
-
-        # Loss placeholder (0.0 used by all clients)
-        return 0.0, {}
-
-    # ------------------------------------------------------------------
-    # JSON export
-    # ------------------------------------------------------------------
-
-    def write_results(self, path: str) -> None:
-        """Merge fit + evaluate metrics per client per round → fl_results.json."""
-        rounds_out = []
-        for entry in self._round_metrics:
-            fit_m  = entry.get("fit",      {})
-            eval_m = entry.get("evaluate", {})
-            all_cids = sorted(set(fit_m.keys()) | set(eval_m.keys()))
-
-            clients = []
-            for cid in all_cids:
-                fm = fit_m.get(cid,  {})
-                em = eval_m.get(cid, {})
-                clients.append({
-                    "client_id"  : cid,
-                    "train_f1"   : fm.get("train_f1",    0.0),
-                    "test_f1"    : em.get("test_f1",     fm.get("test_f1", 0.0)),
-                    "accuracy"   : em.get("accuracy",    0.0),
-                    "num_examples": fm.get("num_examples", em.get("num_examples", 0)),
-                    "predictions": em.get("predictions", []),
-                    "confidences": em.get("confidences", []),
-                })
-
-            rounds_out.append({"round": entry["round"], "clients": clients})
-
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"rounds": rounds_out}, f, indent=2)
-        print(f"\nResults written to: {path}")
-
-
-# ---------------------------------------------------------------------------
-# ServerApp entrypoint & server components factory
-# ---------------------------------------------------------------------------
-
-
-def server_fn(context: Context) -> ServerAppComponents:
-    """Construct strategy and config for the ServerApp."""
-    num_rounds   = context.run_config.get("num-server-rounds", NUM_ROUNDS)
-    local_epochs = context.run_config.get("local-epochs", LOCAL_EPOCHS)
-
-    def fit_config(server_round: int) -> Dict:
-        return {"local_epochs": local_epochs}
-
-    strategy = DHSVFedAvg(
-        fraction_fit          = 1.0,
-        fraction_evaluate     = 1.0,
-        min_fit_clients       = 4,
-        min_evaluate_clients  = 4,
-        min_available_clients = 4,
-        on_fit_config_fn      = fit_config,
+try:
+    from config import (
+        ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
+        LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
+    )
+except ImportError:
+    from pytorchexample.config import (
+        ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
+        LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
     )
 
+try:
+    from task import (
+        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        fedavg_global_equal_stable, load_all_clients_data, load_client_data,
+        prepare_client_data, train_model,
+    )
+except ImportError:
+    from pytorchexample.task import (
+        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        fedavg_global_equal_stable, load_all_clients_data, load_client_data,
+        prepare_client_data, train_model,
+    )
+
+# ---------------------------------------------------------------------------
+# ServerApp entrypoint (for flwr run)
+# ---------------------------------------------------------------------------
+
+def server_fn(context: Context) -> ServerAppComponents:
+    num_rounds   = context.run_config.get("num-server-rounds", NUM_ROUNDS)
+
+    def fit_config(server_round: int) -> Dict:
+        return {"local_epochs": FL_EPOCHS, "lr": FL_LR}
+
+    class SimpleFedAvg:
+        def __init__(self):
+            self.round_metrics = []
+            self.best_avg_f1 = 0.0
+
+        def aggregate_fit(self, server_round, results, failures):
+            from flwr.common import parameters_to_ndarrays
+            import pickle
+            payloads = {}
+            fit_metrics = {}
+            for _, fit_res in results:
+                arr = parameters_to_ndarrays(fit_res.parameters)[0]
+                payload = pickle.loads(bytes(arr.tobytes()))
+                m = fit_res.metrics or {}
+                cid = m.get("client_id", "unknown")
+                payloads[cid] = payload["weights"]
+                fit_metrics[cid] = {
+                    "train_f1": float(m.get("train_f1", 0.0)),
+                    "test_f1": float(m.get("test_f1", 0.0)),
+                    "num_examples": fit_res.num_examples,
+                }
+            clients_data = load_all_clients_data()
+            global_weights = fedavg_global_equal_stable(
+                payloads, clients_data, None, alpha=1.0
+            )
+            agg_payload = {"weights": global_weights}
+            agg_arr = np.frombuffer(pickle.dumps(agg_payload), dtype=np.uint8).copy()
+            from flwr.common import ndarrays_to_parameters
+            parameters = ndarrays_to_parameters([agg_arr])
+
+            avg_f1 = sum(v["test_f1"] for v in fit_metrics.values()) / max(len(fit_metrics), 1)
+            improvement = avg_f1 - self.best_avg_f1
+            self.best_avg_f1 = max(self.best_avg_f1, avg_f1)
+
+            print(f"\n{'='*65}")
+            print(f"  Round {server_round}/{num_rounds} — Fit Results")
+            print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10} {'Samples':>10}")
+            print(f"  {'─'*46}")
+            for cid, m in sorted(fit_metrics.items()):
+                print(f"  {cid:<14} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f} {m['num_examples']:>10,}")
+            print(f"  {'─'*46}")
+            print(f"  {'Avg test F1':<14} {avg_f1:>10.4f}   improvement: {improvement:+.4f}")
+            print(f"{'='*65}")
+
+            self.round_metrics.append({"round": server_round, "fit": fit_metrics, "evaluate": {}})
+            return parameters, {}
+
+        def aggregate_evaluate(self, server_round, results, failures):
+            if not results:
+                return None, {}
+            eval_metrics = {}
+            for _, eval_res in results:
+                m = eval_res.metrics or {}
+                cid = m.get("client_id", "unknown")
+                raw_preds = m.get("predictions", "[]")
+                raw_confs = m.get("confidences", "[]")
+                eval_metrics[cid] = {
+                    "test_f1": float(m.get("test_f1", 0.0)),
+                    "accuracy": float(m.get("accuracy", 0.0)),
+                    "num_examples": eval_res.num_examples,
+                    "predictions": json.loads(raw_preds) if isinstance(raw_preds, str) else raw_preds,
+                    "confidences": json.loads(raw_confs) if isinstance(raw_confs, str) else raw_confs,
+                }
+            for entry in self.round_metrics:
+                if entry["round"] == server_round:
+                    entry["evaluate"] = eval_metrics
+                    break
+            try:
+                write_results(self.round_metrics, RESULTS_PATH)
+            except Exception as e:
+                print(f"Warning: Failed to auto-write results: {e}")
+
+            print(f"\n{'='*65}")
+            print(f"  Round {server_round}/{num_rounds} — Evaluate Results")
+            print(f"  {'Client':<14} {'Test F1':>10} {'Accuracy':>10} {'Samples':>10}")
+            print(f"  {'─'*46}")
+            for cid, m in sorted(eval_metrics.items()):
+                print(f"  {cid:<14} {m['test_f1']:>10.4f} {m['accuracy']:>10.4f} {m['num_examples']:>10,}")
+            print(f"{'='*65}\n")
+            return 0.0, {}
+
+    strategy = SimpleFedAvg()
+    strategy.aggregate_fit = strategy.aggregate_fit
+    strategy.aggregate_evaluate = strategy.aggregate_evaluate
     config = ServerConfig(num_rounds=num_rounds)
     return ServerAppComponents(strategy=strategy, config=config)
 
 
-# App entrypoint for flwr run
 app = ServerApp(server_fn=server_fn)
 
 
 # ---------------------------------------------------------------------------
-# Simulation entry point
+# Results writer (shared between Flower path and direct simulation)
 # ---------------------------------------------------------------------------
 
+def write_results(round_metrics, path, local_baseline=None):
+    rounds_out = []
+    for entry in round_metrics:
+        fit_m  = entry.get("fit", {})
+        eval_m = entry.get("evaluate", {})
+        all_cids = sorted(set(fit_m.keys()) | set(eval_m.keys()))
+        clients = []
+        for cid in all_cids:
+            fm = fit_m.get(cid, {})
+            em = eval_m.get(cid, {})
+            clients.append({
+                "client_id": cid,
+                "train_f1": fm.get("train_f1", 0.0),
+                "test_f1": em.get("test_f1", fm.get("test_f1", 0.0)),
+                "accuracy": em.get("accuracy", 0.0),
+                "num_examples": fm.get("num_examples", em.get("num_examples", 0)),
+                "predictions": em.get("predictions", []),
+                "confidences": em.get("confidences", []),
+            })
+        rounds_out.append({"round": entry["round"], "clients": clients})
 
-def load_client(name: str) -> FlowerClient:
-    """Load data and build a raw FlowerClient (without .to_client() wrapper)."""
-    data    = np.load(os.path.join(DATA_DIR, f"{name}.npz"))
-    X_train = data["X_train"]
-    X_test  = data["X_test"]
-    y_train = data["y_train"]
-    y_test  = data["y_test"]
+    output = {"rounds": rounds_out}
+    if local_baseline is not None:
+        output["local_baseline"] = local_baseline
 
-    import pandas as pd
-    sensors_csv  = os.path.join(DATA_DIR, f"{name}_sensors.csv")
-    sensor_names = pd.read_csv(sensors_csv)["sensor_name"].tolist()
-    window_size  = X_train.shape[1]
-
-    model = iTransformerPerSensor(sensor_names=sensor_names, window_size=window_size).to(DEVICE)
-    return FlowerClient(model, X_train, y_train, X_test, y_test, name)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2)
+    print(f"\nResults written to: {path}")
 
 
-def main() -> None:
-    print("\n" + "="*65)
-    print("  DHSV Fault Detection — Federated Learning Simulation")
-    print("="*65)
-    print(f"  Rounds       : {NUM_ROUNDS}")
-    print(f"  Local epochs : {LOCAL_EPOCHS} per round")
+# ---------------------------------------------------------------------------
+# Simulation entry point — Phase 1 (full local training) + Phase 2 (FL rounds)
+# ---------------------------------------------------------------------------
+
+def main():
+    print("\n" + "=" * 65)
+    print("  DHSV Fault Detection — Two-Phase Federated Learning")
+    print("=" * 65)
     print(f"  Clients      : {len(CLIENT_MAP)}  ({', '.join(CLIENT_MAP.values())})")
     print(f"  Data dir     : {DATA_DIR}")
     print(f"  Results path : {RESULTS_PATH}")
-    print("="*65 + "\n")
+    print(f"  Phase 1      : {LOCAL_EPOCHS} local epochs, LR={LR}")
+    print(f"  Phase 2      : {NUM_ROUNDS} rounds x {FL_EPOCHS} epochs, LR={FL_LR}, alpha={ALPHA}")
+    print("=" * 65 + "\n")
 
-    def fit_config(server_round: int) -> Dict:
-        return {"local_epochs": LOCAL_EPOCHS}
+    # -- Pre-load all client data once ------------------------------------
+    clients_data = load_all_clients_data()
 
-    strategy = DHSVFedAvg(
-        fraction_fit          = 1.0,
-        fraction_evaluate     = 1.0,
-        min_fit_clients       = 4,
-        min_evaluate_clients  = 4,
-        min_available_clients = 4,
-        on_fit_config_fn      = fit_config,
-    )
+    # -- Build sensor map from ALL clients --------------------------------
+    sensor_map = build_sensor_map(clients_data)
+    all_sensors = sensor_map["all_sensors"]
+    print(f"  Global sensor universe ({len(all_sensors)} sensors): {all_sensors}\n")
 
-    start_simulation(
-        client_fn         = client_fn,
-        num_clients       = len(CLIENT_MAP),
-        config            = ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy          = strategy,
-        client_resources  = {"num_cpus": 1, "num_gpus": 0.25},
-    )
+    for cid, data in clients_data.items():
+        print(f"  {cid}: sensors={data['sensor_names']} ({len(data['sensor_names'])}/{len(all_sensors)})")
 
-    strategy.write_results(RESULTS_PATH)
+    # =====================================================================
+    # Phase 1 — Full local training (no aggregation, no weight sharing)
+    # =====================================================================
+    print(f"\n{'#'*65}")
+    print(f"  {'#'*61}")
+    print(f"  {'PHASE 1':^61}")
+    print(f"  {'Full Local Training — each client trains independently':^61}")
+    print(f"  {'#'*61}")
+    print(f"{'#'*65}")
+
+    local_results = {}
+    client_loaders = {}
+
+    for client_id in sorted(clients_data.keys()):
+        data = clients_data[client_id]
+        model = GlobalModel(
+            all_sensors=all_sensors,
+            window_size=data["window_size"],
+        ).to(DEVICE)
+
+        tr_loader, tr_eval, te_loader, class_w, sensor_mask = prepare_client_data(data, sensor_map)
+
+        res, _ = train_model(
+            model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
+            n_epochs=LOCAL_EPOCHS, lr=LR,
+            client_id=f"{client_id} (Phase 1)",
+        )
+
+        client_loaders[client_id] = (tr_loader, tr_eval, te_loader, class_w, sensor_mask, model)
+        local_results[client_id] = res
+
+    local_avg_f1 = np.mean([v["test"]["f1"] for v in local_results.values()])
+    print(f"\n{'='*65}")
+    print(f"  Phase 1 Complete — Local Training Results")
+    print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10}")
+    print(f"  {'─'*36}")
+    for cid in sorted(local_results.keys()):
+        r = local_results[cid]
+        print(f"  {cid:<14} {r['train']['f1']:>10.4f} {r['test']['f1']:>10.4f}")
+    print(f"  {'─'*36}")
+    print(f"  {'Avg Test F1':<24} {local_avg_f1:>10.4f}")
+    print(f"{'='*65}")
+
+    # =====================================================================
+    # Phase 2 — FL rounds (lightweight fine-tuning + aggregation)
+    # =====================================================================
+    print(f"\n{'#'*65}")
+    print(f"  {'#'*61}")
+    print(f"  {'PHASE 2':^61}")
+    print(f"  {'Federated Fine-Tuning — {NUM_ROUNDS} rounds':^61}")
+    print(f"  {'#'*61}")
+    print(f"{'#'*65}")
+
+    global_weights = None
+    round_metrics = []
+
+    for fl_round in range(1, NUM_ROUNDS + 1):
+        round_payloads = {}
+        round_results = {}
+
+        for client_id in sorted(clients_data.keys()):
+            tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[client_id]
+
+            if global_weights is not None:
+                model.load_weights(global_weights)
+
+            res, _ = train_model(
+                model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
+                n_epochs=FL_EPOCHS, lr=FL_LR,
+                use_early_stop=False,
+                client_id=f"{client_id} (FL Round {fl_round})",
+            )
+
+            client_loaders[client_id] = (tr_loader, tr_eval, te_loader, class_w, sensor_mask, model)
+            round_payloads[client_id] = model.get_weights()
+            round_results[client_id] = res
+
+        global_weights = fedavg_global_equal_stable(
+            round_payloads, clients_data, global_weights, alpha=ALPHA,
+        )
+
+        # -- Log round metrics --------------------------------------------
+        fit_metrics = {}
+        for cid, res in round_results.items():
+            fit_metrics[cid] = {
+                "train_f1": float(res["train"]["f1"]),
+                "test_f1":  float(res["test"]["f1"]),
+            }
+
+        avg_f1 = np.mean([v["test"]["f1"] for v in round_results.values()])
+        improvement = avg_f1 - local_avg_f1
+
+        print(f"\n{'='*65}")
+        print(f"  FL Round {fl_round}/{NUM_ROUNDS} — Results")
+        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10}")
+        print(f"  {'─'*36}")
+        for cid, m in sorted(fit_metrics.items()):
+            print(f"  {cid:<14} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f}")
+        print(f"  {'─'*36}")
+        print(f"  {'Avg Test F1':<24} {avg_f1:>10.4f}   vs local: {improvement:+.4f}")
+        print(f"{'='*65}")
+
+        round_metrics.append({
+            "round": fl_round,
+            "fit": fit_metrics,
+            "evaluate": {},
+        })
+
+    # =====================================================================
+    # Final report
+    # =====================================================================
+    print(f"\n{'#'*65}")
+    print(f"  {'FINAL COMPARISON':^61}")
+    print(f"{'#'*65}")
+    print(f"  {'Client':<14} {'Local Test F1':>14} {'FL Test F1':>14} {'Change':>10}")
+    print(f"  {'─'*54}")
+
+    final_fl_results = round_metrics[-1]["fit"]
+    total_local = 0.0
+    total_fl = 0.0
+    for cid in sorted(local_results.keys()):
+        local_f1 = local_results[cid]["test"]["f1"]
+        fl_f1 = final_fl_results.get(cid, {}).get("test_f1", 0.0)
+        change = fl_f1 - local_f1
+        total_local += local_f1
+        total_fl += fl_f1
+        print(f"  {cid:<14} {local_f1:>14.4f} {fl_f1:>14.4f} {change:>+10.4f}")
+
+    n = len(local_results)
+    print(f"  {'─'*54}")
+    print(f"  {'Average':<14} {total_local/n:>14.4f} {total_fl/n:>14.4f} {(total_fl-total_local)/n:>+10.4f}")
+    print(f"{'#'*65}")
+
+    # -- Build local baseline for results JSON ----------------------------
+    local_baseline = {}
+    for cid in sorted(local_results.keys()):
+        r = local_results[cid]
+        local_baseline[cid] = {
+            "test_f1": r["test"]["f1"],
+            "train_f1": r["train"]["f1"],
+            "accuracy": r["test"]["accuracy"],
+        }
+
+    write_results(round_metrics, RESULTS_PATH, local_baseline=local_baseline)
 
 
 if __name__ == "__main__":

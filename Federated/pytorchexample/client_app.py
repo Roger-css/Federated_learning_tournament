@@ -1,17 +1,3 @@
-"""DHSV Fault Detection — Flower Client (NumPyClient).
-
-Weight exchange protocol
-------------------------
-Flower's NumPyClientWrapper passes whatever get_parameters() returns through
-ndarrays_to_parameters(), which calls np.save() on each element.  Raw bytes
-(pickle output) cannot be saved that way.  The fix: wrap the pickled payload
-as a numpy uint8 array — np.save/np.load handles uint8 arrays natively, and
-tobytes() recovers the original byte sequence for pickle.loads().
-
-    get_parameters  → [np.frombuffer(pickle.dumps(payload), dtype=np.uint8)]
-    set_parameters  → pickle.loads(bytes(parameters[0].tobytes()))
-"""
-
 import json
 import pickle
 import time
@@ -21,115 +7,83 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-import os
-import pandas as pd
 import flwr as fl
 from flwr.client import ClientApp, NumPyClient
 
-from config import CLIENT_MAP, DATA_DIR
-from task import DEVICE, iTransformerPerSensor
+try:
+    from config import CLIENT_MAP
+except ImportError:
+    from pytorchexample.config import CLIENT_MAP
 
-CLIENT_STATE_DIR = os.path.join(DATA_DIR, ".client_states")
+try:
+    from task import (
+        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        load_all_clients_data, load_client_data, prepare_client_data,
+    )
+except ImportError:
+    from pytorchexample.task import (
+        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        load_all_clients_data, load_client_data, prepare_client_data,
+    )
+
+sensor_map = None
+
 class FlowerClient(NumPyClient):
-    """NumPyClient for a single oil-well client."""
-
-    def __init__(
-        self,
-        model: iTransformerPerSensor,
-        X_train: np.ndarray,
-        y_train: np.ndarray,
-        X_test: np.ndarray,
-        y_test: np.ndarray,
-        client_id: str,
-    ):
-        self.model     = model.to(DEVICE)
-        self.X_train   = X_train
-        self.y_train   = y_train
-        self.X_test    = X_test
-        self.y_test    = y_test
-        self.client_id = client_id
-
-    # ------------------------------------------------------------------
-    # Weight exchange helpers
-    # ------------------------------------------------------------------
+    def __init__(self, model, tr_loader, tr_eval, te_loader, class_w,
+                 sensor_mask, client_id):
+        self.model       = model.to(DEVICE)
+        self.tr_loader   = tr_loader
+        self.tr_eval     = tr_eval
+        self.te_loader   = te_loader
+        self.class_w     = class_w
+        self.sensor_mask = sensor_mask
+        self.client_id   = client_id
 
     def get_parameters(self, config):
-        """Serialize shared params as a single numpy uint8 array."""
-        payload    = self.model.get_payload()
-        serialized = pickle.dumps(payload)
-        arr        = np.frombuffer(serialized, dtype=np.uint8).copy()
+        weights = self.model.get_weights()
+        payload = {"weights": weights}
+        arr = np.frombuffer(pickle.dumps(payload), dtype=np.uint8).copy()
         return [arr]
 
     def set_parameters(self, parameters):
-        """Deserialize and load global (shared + sensor embeddings) into model."""
-        arr     = parameters[0]
+        arr = parameters[0]
         payload = pickle.loads(bytes(arr.tobytes()))
-        n_shared = len(payload["shared_weights"])
-        n_sensors = len(payload["sensor_embeddings"])
-        print(f"[{self.client_id}] set_parameters: shared={n_shared} keys, sensor_embeddings={n_sensors} sensors")
-        self.model.load_global(payload)
-
-    # ------------------------------------------------------------------
-    # Flower interface — fit
-    # ------------------------------------------------------------------
+        self.model.load_weights(payload["weights"])
 
     def fit(self, parameters, config):
-        """Train for one FL round and return updated weights + metrics."""
         self.set_parameters(parameters)
-        shared_count = len(pickle.loads(bytes(parameters[0].tobytes()))["shared_weights"])
-        print(f"[{self.client_id}] evaluate payload shared keys count: {shared_count}")
         local_epochs = int(config.get("local_epochs", 5))
-        
-        best_res, _ = self.model.fit(
-            self.X_train, self.y_train,
-            self.X_test,  self.y_test,
-            client_id    = self.client_id,
-            n_epochs     = local_epochs,
-            use_early_stop = False,
+
+        best_res, _ = train_model(
+            self.model, self.tr_loader, self.tr_eval, self.te_loader,
+            self.class_w, self.sensor_mask,
+            n_epochs=local_epochs, lr=float(config.get("lr", 1e-4)),
+            use_early_stop=False, client_id=self.client_id,
         )
-        state_path = os.path.join(CLIENT_STATE_DIR, f"{self.client_id}_local.pt")
-        self.model.save_local_params(state_path)
-        print(f"[{self.client_id}][{time.time()}] SAVED local params to {state_path}")
         metrics = {
-            "train_f1":  float(best_res["train"]["f1"]), # type: ignore
-            "test_f1":   float(best_res["test"]["f1"]), # type: ignore
+            "train_f1":  float(best_res["train"]["f1"]),
+            "test_f1":   float(best_res["test"]["f1"]),
             "client_id": self.client_id,
         }
-        return self.get_parameters(config={}), len(self.X_train), metrics
-
-    # ------------------------------------------------------------------
-    # Flower interface — evaluate
-    # ------------------------------------------------------------------
+        return self.get_parameters(config={}), len(self.tr_loader.dataset), metrics
 
     def evaluate(self, parameters, config):
-        """Evaluate on the local test set and return metrics + predictions."""
         self.set_parameters(parameters)
-        print(f"[{self.client_id}] evaluate: model device={next(self.model.parameters()).device}")
-        n          = len(self.X_test)
-        batch_size = 64 if n > 20_000 else (32 if n > 5_000 else 16)
-        Xte        = torch.tensor(self.X_test, dtype=torch.float32)
-        yte        = torch.tensor(self.y_test,  dtype=torch.long)
-        te_loader  = DataLoader(TensorDataset(Xte, yte), batch_size=batch_size, shuffle=False)
+        n = len(self.te_loader.dataset)
 
-        # Standard metrics (f1, accuracy)
-        eval_res = self.model._evaluate(te_loader)
+        eval_res = evaluate(self.model, self.te_loader, self.sensor_mask)
 
-        # Separate forward pass to capture raw logits → softmax → confidences
-        # (model._evaluate does not return logits, so we replicate the loop here
-        #  without modifying the model class)
         self.model.eval()
-        logits_list: list = []
+        logits_list = []
         with torch.no_grad():
-            for X, _ in te_loader:
-                logits_list.append(self.model(X.to(DEVICE)).cpu())
+            for X, _ in self.te_loader:
+                logits_list.append(self.model(X.to(DEVICE), self.sensor_mask).cpu())
 
-        logits      = torch.cat(logits_list, dim=0)          # [N, num_classes]
-        probs       = F.softmax(logits, dim=1)               # [N, num_classes]
-        predictions = probs.argmax(dim=1).tolist()           # list[int]
-        confidences = probs.max(dim=1).values.tolist()       # list[float]
+        logits      = torch.cat(logits_list, dim=0)
+        probs       = F.softmax(logits, dim=1)
+        predictions = probs.argmax(dim=1).tolist()
+        confidences = probs.max(dim=1).values.tolist()
 
-        # Flower Scalar values must be bool | bytes | float | int | str
-        # → serialize lists as JSON strings
         metrics = {
             "test_f1":     float(eval_res["f1"]),
             "accuracy":    float(eval_res["accuracy"]),
@@ -140,52 +94,36 @@ class FlowerClient(NumPyClient):
         return 0.0, n, metrics
 
 
-# ---------------------------------------------------------------------------
-# ClientApp entrypoint & client factory
-# ---------------------------------------------------------------------------
-
-
 def client_fn(cid_or_context):
-    """Load data + sensors for cid/context and return a FlowerClient."""
+    global sensor_map
+    if sensor_map is None:
+        clients_data = load_all_clients_data()
+        sensor_map = build_sensor_map(clients_data)
+
     if hasattr(cid_or_context, "node_config"):
-        # Context object (from ClientApp)
         node_config = cid_or_context.node_config
         partition_id = node_config.get("partition-id", node_config.get("partition_id", 0))
         cid = str(partition_id)
     else:
-        # Simple client ID string (from simulation / start_simulation)
         cid = str(cid_or_context)
 
     client_name = CLIENT_MAP[cid]
-    
-    # Load numpy arrays
-    data    = np.load(os.path.join(DATA_DIR, f"{client_name}.npz"))
-    X_train = data["X_train"]
-    X_test  = data["X_test"]
-    y_train = data["y_train"]
-    y_test  = data["y_test"]
 
-    # Load ordered sensor names
-    sensors_csv  = os.path.join(DATA_DIR, f"{client_name}_sensors.csv")
-    sensor_names = pd.read_csv(sensors_csv)["sensor_name"].tolist()
+    data = load_client_data(client_name)
+    model = GlobalModel(all_sensors=sensor_map["all_sensors"],
+                        window_size=data["window_size"]).to(DEVICE)
+    tr_loader, tr_eval, te_loader, class_w, sensor_mask = prepare_client_data(data, sensor_map)
 
-    # window_size is always X_train.shape[1] (16)
-    window_size = X_train.shape[1]
-
-    model = iTransformerPerSensor(sensor_names=sensor_names, window_size=window_size)
-    state_path = os.path.join(CLIENT_STATE_DIR, f"{client_name}_local.pt")
-    is_loaded = model.load_local_params(state_path)
-    print(f"[{client_name}] Local state load attempt | path={state_path} | Success={is_loaded}")
-    print(f"[{client_name}][{time.time()}] LOAD attempted: path={state_path}, exists={os.path.exists(state_path)}")
     return FlowerClient(
-        model     = model,
-        X_train   = X_train,
-        y_train   = y_train,
-        X_test    = X_test,
-        y_test    = y_test,
-        client_id = client_name,
+        model=model, tr_loader=tr_loader, tr_eval=tr_eval,
+        te_loader=te_loader, class_w=class_w,
+        sensor_mask=sensor_mask, client_id=client_name,
     ).to_client()
 
 
-# App entrypoint for flwr run
+try:
+    from task import train_model
+except ImportError:
+    from pytorchexample.task import train_model
+
 app = ClientApp(client_fn=client_fn)
