@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FL Dashboard - Federated Learning Overview</title>
+    
+    <!-- External Dependencies: FontAwesome for Icons, Google Fonts for Typography -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- Core Application Styles -->
+    <link rel="stylesheet" href="style.css">
+    
+    <!-- Charting Engine Library -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body id="dashboard-page">
+
+    <!-- NAVIGATION SIDEBAR -->
+    <aside>
+        <div class="logo">
+            <i class="fas fa-microchip"></i>
+            <span>FL Dashboard</span>
+        </div>
+        
+        <nav aria-label="Main Navigation">
+            <a href="index.html" class="nav-link active" title="View Global Dashboard">
+                <i class="fas fa-chart-line" aria-hidden="true"></i>
+                <span>Main Dashboard</span>
+            </a>
+            <a href="monitoring.html" class="nav-link" title="Monitor Sensor Data">
+                <i class="fas fa-broadcast-tower" aria-hidden="true"></i>
+                <span>Sensor Monitoring</span>
+            </a>
+            <a href="detection.html" class="nav-link" title="Fault Analysis Results">
+                <i class="fas fa-exclamation-triangle" aria-hidden="true"></i>
+                <span>Fault Detection</span>
+            </a>
+            <a href="comparison.html" class="nav-link" title="Compare Models Performance">
+                <i class="fas fa-balance-scale" aria-hidden="true"></i>
+                <span>Local vs Global</span>
+            </a>
+
+        </nav>
+    </aside>
+
+    <!-- PAGE CONTENT WRAPPER -->
+    <main id="content">
+        
+        <header class="header">
+            <h1 class="title">Global Training Overview</h1>
+            <p class="subtitle">High-level summary of Federated Learning training progress across all participating nodes.</p>
+        </header>
+        
+        <!-- TOP STATISTICS GRID -->
+        <section class="grid grid-cols-4" aria-label="Quick Stats">
+            <article class="card stat-card">
+                <span class="stat-label">Total Clients</span>
+                <span class="stat-value">4</span>
+            </article>
+            <article class="card stat-card">
+                <span class="stat-label">Current Round</span>
+                <span class="stat-value">7/10</span>
+            </article>
+            <article class="card stat-card">
+                <span class="stat-label">Global F1 Score</span>
+                <span class="stat-value">0.92</span>
+            </article>
+            <article class="card stat-card">
+                <span class="stat-label">Shared Sensors</span>
+                <span class="stat-value">12</span>
+            </article>
+        </section>
+
+        <!-- SENSOR MAP VISUALIZATION -->
+        <section class="card" style="margin-top: 2rem;">
+            <h3><i class="fas fa-map-marked-alt"></i> Distributed Sensors Discovery (SENSOR_MAP)</h3>
+            <div class="sensor-map">
+                <div class="sensor-node" title="Pressure Sensor 1">P-1</div>
+                <div class="sensor-node" title="Temperature Sensor 1">T-1</div>
+                <div class="sensor-node">P-2</div>
+                <div class="sensor-node">T-2</div>
+                <div class="sensor-node">F-1</div>
+                <div class="sensor-node">V-1</div>
+                <div class="sensor-node">P-3</div>
+                <div class="sensor-node">T-3</div>
+                <div class="sensor-node">P-4</div>
+                <div class="sensor-node">T-4</div>
+                <div class="sensor-node">F-2</div>
+                <div class="sensor-node">V-2</div>
+            </div>
+        </section>
+
+        <!-- DATA GRAPHS & SUBMISSIONS TABLE -->
+        <div class="grid grid-cols-2" style="margin-top: 2rem;">
+            <!-- F1 Metrics Chart -->
+            <section class="card">
+                <h3><i class="fas fa-chart-area"></i> Global Performance Pipeline</h3>
+                <div class="chart-container">
+                    <canvas id="f1Chart"></canvas>
+                </div>
+            </section>
+
+            <!-- Active Submissions Table -->
+            <section class="card">
+                <h3><i class="fas fa-table"></i> Active Node Sync Status</h3>
+                <table aria-label="Client Submission Status">
+                    <thead>
+                        <tr>
+                            <th>Client Node</th>
+                            <th>Current Status</th>
+                            <th>Local F1</th>
+                            <th>Last Update</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Client 1</td>
+                            <td><span class="badge badge-success"><i class="fas fa-check"></i> Weights Sync</span></td>
+                            <td>0.88</td>
+                            <td>1 min ago</td>
+                        </tr>
+                        <tr>
+                            <td>Client 2</td>
+                            <td><span class="badge badge-success"><i class="fas fa-check"></i> Weights Sync</span></td>
+                            <td>0.85</td>
+                            <td>5 mins ago</td>
+                        </tr>
+                        <tr>
+                            <td>Client 3</td>
+                            <td><span class="badge badge-warning"><i class="fas fa-clock"></i> In Training</span></td>
+                            <td>0.82</td>
+                            <td>N/A</td>
+                        </tr>
+                        <tr>
+                            <td>Client 4</td>
+                            <td><span class="badge badge-success"><i class="fas fa-check"></i> Weights Sync</span></td>
+                            <td>0.89</td>
+                            <td>2 mins ago</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+        </div>
+    </main>
+
+    <!-- Main Logic Script -->
+    <script src="app.js"></script>
+</body>
+</html>

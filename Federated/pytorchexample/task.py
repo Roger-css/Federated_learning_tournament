@@ -368,6 +368,26 @@ def evaluate(model, loader, sensor_mask):
         "preds"   : preds,
     }
 
+@torch.no_grad()
+def evaluate_detailed(model, te_loader, sensor_mask):
+    model.eval()
+    logits_list = []
+    for X, _ in te_loader:
+        logits_list.append(model(X.to(DEVICE), sensor_mask).cpu())
+    logits      = torch.cat(logits_list, dim=0)
+    probs       = F.softmax(logits, dim=1)
+    predictions = probs.argmax(dim=1).tolist()
+    confidences = probs.max(dim=1).values.tolist()
+    preds_np    = np.array(predictions)
+    labels_np   = np.concatenate([y.numpy() for _, y in te_loader])
+    return {
+        "test_f1":      float(f1_score(labels_np, preds_np, average="macro", zero_division=0)),
+        "accuracy":     float(accuracy_score(labels_np, preds_np)),
+        "predictions":  predictions,
+        "confidences":  confidences,
+        "num_examples": len(predictions),
+    }
+
 # ---------------------------------------------------------------------------
 # fedavg_global_equal_stable
 # ---------------------------------------------------------------------------

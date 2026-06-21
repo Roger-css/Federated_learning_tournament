@@ -8,6 +8,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import requests
 import numpy as np
 import torch
 
@@ -27,16 +28,63 @@ except ImportError:
 
 try:
     from task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        DEVICE, GlobalModel, build_sensor_map, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
 except ImportError:
     from pytorchexample.task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        DEVICE, GlobalModel, build_sensor_map, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
+
+# ---------------------------------------------------------------------------
+# Backend API reporting
+# ---------------------------------------------------------------------------
+
+FL_API_BASE = "http://localhost:8080/api/fl"
+
+def report_local_baseline_to_backend(local_results: dict):
+    payload = {
+        "clients": [
+            {
+                "clientId": cid,
+                "trainF1": r["train_f1"],
+                "testF1": r["test_f1"],
+                "accuracy": r["accuracy"],
+                "numExamples": r["num_examples"],
+            }
+            for cid, r in local_results.items()
+        ]
+    }
+    try:
+        resp = requests.post(f"{FL_API_BASE}/local-baseline", json=payload, timeout=5)
+        resp.raise_for_status()
+        print(f"  [Backend] Local baseline reported successfully (status {resp.status_code})")
+    except requests.exceptions.RequestException as e:
+        print(f"  [Backend] WARNING: failed to report local baseline to backend: {e}")
+
+def report_round_to_backend(round_number: int, round_results: dict):
+    payload = {
+        "roundNumber": round_number,
+        "clients": [
+            {
+                "clientId": cid,
+                "trainF1": r["train_f1"],
+                "testF1": r["test_f1"],
+                "accuracy": r["accuracy"],
+                "numExamples": r["num_examples"],
+            }
+            for cid, r in round_results.items()
+        ]
+    }
+    try:
+        resp = requests.post(f"{FL_API_BASE}/rounds", json=payload, timeout=5)
+        resp.raise_for_status()
+        print(f"  [Backend] Round {round_number} reported successfully (status {resp.status_code})")
+    except requests.exceptions.RequestException as e:
+        print(f"  [Backend] WARNING: failed to report round {round_number} to backend: {e}")
 
 # ---------------------------------------------------------------------------
 # ServerApp entrypoint (for flwr run)
@@ -283,29 +331,47 @@ def main():
 
         # -- Log round metrics --------------------------------------------
         fit_metrics = {}
+        eval_metrics = {}
         for cid, res in round_results.items():
             fit_metrics[cid] = {
                 "train_f1": float(res["train"]["f1"]),
                 "test_f1":  float(res["test"]["f1"]),
             }
+            tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
+            ev = evaluate_detailed(model, te_loader, sensor_mask)
+            eval_metrics[cid] = ev
 
         avg_f1 = np.mean([v["test"]["f1"] for v in round_results.values()])
-        improvement = avg_f1 - local_avg_f1
 
         print(f"\n{'='*65}")
         print(f"  FL Round {fl_round}/{NUM_ROUNDS} — Results")
-        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10}")
-        print(f"  {'─'*36}")
-        for cid, m in sorted(fit_metrics.items()):
-            print(f"  {cid:<14} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f}")
-        print(f"  {'─'*36}")
-        print(f"  {'Avg Test F1':<24} {avg_f1:>10.4f}   vs local: {improvement:+.4f}")
+        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10} {'Accuracy':>10} {'Samples':>8} {'Preds':>6} {'Confs':>6}")
+        print(f"  {'─'*66}")
+        for cid in sorted(fit_metrics.keys()):
+            fm = fit_metrics[cid]
+            em = eval_metrics[cid]
+            print(f"  {cid:<14} {fm['train_f1']:>10.4f} {fm['test_f1']:>10.4f} {em['accuracy']:>10.4f} {em['num_examples']:>8} {len(em['predictions']):>6} {len(em['confidences']):>6}")
+        print(f"  {'─'*66}")
+        print(f"  {'Avg test F1':<24} {avg_f1:>10.4f}")
         print(f"{'='*65}")
+
+        # Build merged per-client dict for backend reporting (no predictions/confidences)
+        round_report = {}
+        for cid in sorted(fit_metrics.keys()):
+            fm = fit_metrics[cid]
+            em = eval_metrics[cid]
+            round_report[cid] = {
+                "train_f1": fm["train_f1"],
+                "test_f1": em["test_f1"],
+                "accuracy": em["accuracy"],
+                "num_examples": em["num_examples"],
+            }
+        report_round_to_backend(fl_round, round_report)
 
         round_metrics.append({
             "round": fl_round,
             "fit": fit_metrics,
-            "evaluate": {},
+            "evaluate": eval_metrics,
         })
 
     # =====================================================================
@@ -336,13 +402,19 @@ def main():
     # -- Build local baseline for results JSON ----------------------------
     local_baseline = {}
     for cid in sorted(local_results.keys()):
+        tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
+        ev = evaluate_detailed(model, te_loader, sensor_mask)
         r = local_results[cid]
         local_baseline[cid] = {
-            "test_f1": r["test"]["f1"],
-            "train_f1": r["train"]["f1"],
-            "accuracy": r["test"]["accuracy"],
+            "test_f1":      float(r["test"]["f1"]),
+            "train_f1":     float(r["train"]["f1"]),
+            "accuracy":     float(ev["accuracy"]),
+            "predictions":  ev["predictions"],
+            "confidences":  ev["confidences"],
+            "num_examples": ev["num_examples"],
         }
 
+    report_local_baseline_to_backend(local_baseline)
     write_results(round_metrics, RESULTS_PATH, local_baseline=local_baseline)
 
 
