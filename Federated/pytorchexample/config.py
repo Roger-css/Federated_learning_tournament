@@ -25,5 +25,4 @@ CLIENT_MAP = {
     "0": "client_1",
     "1": "client_2",
     "2": "client_3",
-    "3": "client_13",
 }
