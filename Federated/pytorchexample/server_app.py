@@ -291,6 +291,22 @@ def main():
     print(f"  {'Avg Test F1':<24} {local_avg_f1:>10.4f}")
     print(f"{'='*65}")
 
+    # -- Report local baseline to backend immediately (before Phase 2) -----
+    local_baseline = {}
+    for cid in sorted(local_results.keys()):
+        tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
+        ev = evaluate_detailed(model, te_loader, sensor_mask)
+        r = local_results[cid]
+        local_baseline[cid] = {
+            "test_f1":      float(r["test"]["f1"]),
+            "train_f1":     float(r["train"]["f1"]),
+            "accuracy":     float(ev["accuracy"]),
+            "predictions":  ev["predictions"],
+            "confidences":  ev["confidences"],
+            "num_examples": ev["num_examples"],
+        }
+    report_local_baseline_to_backend(local_baseline)
+
     # =====================================================================
     # Phase 2 — FL rounds (lightweight fine-tuning + aggregation)
     # =====================================================================
@@ -399,22 +415,6 @@ def main():
     print(f"  {'Average':<14} {total_local/n:>14.4f} {total_fl/n:>14.4f} {(total_fl-total_local)/n:>+10.4f}")
     print(f"{'#'*65}")
 
-    # -- Build local baseline for results JSON ----------------------------
-    local_baseline = {}
-    for cid in sorted(local_results.keys()):
-        tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
-        ev = evaluate_detailed(model, te_loader, sensor_mask)
-        r = local_results[cid]
-        local_baseline[cid] = {
-            "test_f1":      float(r["test"]["f1"]),
-            "train_f1":     float(r["train"]["f1"]),
-            "accuracy":     float(ev["accuracy"]),
-            "predictions":  ev["predictions"],
-            "confidences":  ev["confidences"],
-            "num_examples": ev["num_examples"],
-        }
-
-    report_local_baseline_to_backend(local_baseline)
     write_results(round_metrics, RESULTS_PATH, local_baseline=local_baseline)
 
 

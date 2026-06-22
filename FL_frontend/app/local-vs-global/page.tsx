@@ -93,17 +93,19 @@ export default function LocalVsGlobalPage() {
 
   const hasBaseline = baseline.length > 0
   const hasGlobal = Object.keys(latestGlobal).length > 0
-  const hasData = hasBaseline && hasGlobal
+  const hasAny = hasBaseline || hasGlobal
 
   // Averages
+  const localRows = rows.filter((r) => r.localF1 > 0)
+  const globalRows = rows.filter((r) => r.globalF1 > 0)
   const completedRows = rows.filter((r) => r.localF1 > 0 && r.globalF1 > 0)
   const avgLocal =
-    completedRows.length > 0
-      ? completedRows.reduce((sum, r) => sum + r.localF1, 0) / completedRows.length
+    localRows.length > 0
+      ? localRows.reduce((sum, r) => sum + r.localF1, 0) / localRows.length
       : null
   const avgGlobal =
-    completedRows.length > 0
-      ? completedRows.reduce((sum, r) => sum + r.globalF1, 0) / completedRows.length
+    globalRows.length > 0
+      ? globalRows.reduce((sum, r) => sum + r.globalF1, 0) / globalRows.length
       : null
   const avgDelta =
     completedRows.length > 0
@@ -139,56 +141,56 @@ export default function LocalVsGlobalPage() {
         </div>
       )}
 
-      {/* Average comparison banner */}
-      {avgDelta !== null && (
-        <div className="rounded-lg border border-border bg-muted/40 px-4 py-3 text-sm">
-          <span className="font-medium text-foreground">FL impact summary: </span>
-          <span className="ml-1 text-muted-foreground">Local avg </span>
-          <span className="font-mono text-foreground">{avgLocal!.toFixed(4)}</span>
-          <span className="mx-1.5 text-muted-foreground">→</span>
-          <span className="text-muted-foreground">Global avg </span>
-          <span
-            className={cn(
-              'font-mono font-semibold',
-              avgDelta > 0
-                ? 'text-emerald-700 dark:text-emerald-400'
-                : avgDelta < 0
-                ? 'text-rose-700 dark:text-rose-400'
-                : 'text-muted-foreground'
-            )}
-          >
-            {avgGlobal!.toFixed(4)}
-          </span>
-          <span className="ml-2 text-muted-foreground">
-            ({avgDelta >= 0 ? '+' : ''}{avgDelta.toFixed(4)} &middot; {completedRows.length}/{CLIENT_IDS.length} clients)
-          </span>
+      {/* Loading state */}
+      {!loaded && !fetchError && (
+        <div className="flex items-center justify-center py-20 text-sm text-muted-foreground">
+          Loading…
         </div>
       )}
 
-      {/* Missing data notices */}
-      {loaded && !fetchError && !hasData && (
+      {/* Missing data notice */}
+      {loaded && !fetchError && !hasAny && (
         <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border py-20 text-center">
           <p className="font-medium text-foreground">No comparison data yet</p>
           <p className="mt-1 max-w-sm text-sm text-muted-foreground">
-            {!hasBaseline
-              ? 'Phase 1 (local baseline) has not been run yet.'
-              : 'Phase 2 (federated rounds) has not started yet.'}
-            {' '}Start the FL simulation to populate this view.
+            Start the FL simulation to populate this view.
           </p>
         </div>
       )}
 
-      {loaded && !fetchError && hasBaseline && !hasGlobal && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800/40 dark:bg-amber-900/20 dark:text-amber-300">
-          Phase 1 baseline loaded. Waiting for Phase 2 federated rounds to begin…
+      {/* Average comparison cards — visible as soon as any data exists */}
+      {hasAny && (
+        <div className="grid grid-cols-3 gap-4">
+          <div className="rounded-xl border border-border bg-card p-4 text-center">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Local Avg F1</p>
+            <p className={cn('mt-1 text-2xl font-bold', avgLocal !== null ? 'text-foreground' : 'text-muted-foreground')}>
+              {avgLocal !== null ? avgLocal.toFixed(4) : '—'}
+            </p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-4 text-center">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Global Avg F1</p>
+            <p className={cn('mt-1 text-2xl font-bold', avgGlobal !== null ? 'text-foreground' : 'text-muted-foreground')}>
+              {avgGlobal !== null ? avgGlobal.toFixed(4) : '—'}
+            </p>
+          </div>
+          <div className="rounded-xl border border-border bg-card p-4 text-center">
+            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Change</p>
+            <p className={cn('mt-1 text-2xl font-bold', avgDelta !== null ? (avgDelta > 0 ? 'text-emerald-700 dark:text-emerald-400' : avgDelta < 0 ? 'text-rose-700 dark:text-rose-400' : 'text-foreground') : 'text-muted-foreground')}>
+              {avgDelta !== null ? (avgDelta >= 0 ? '+' : '') + avgDelta.toFixed(4) : '—'}
+            </p>
+          </div>
         </div>
       )}
 
-      {/* Bar chart */}
-      {hasData && (
+      {/* Bar chart + table — visible as soon as any data exists */}
+      {hasAny && (
         <>
           <section aria-label="Local vs global F1 comparison chart">
-            <h2 className="mb-3 text-sm font-medium text-foreground">Test F1: Local vs Federated</h2>
+            <h2 className="mb-3 text-sm font-medium text-foreground">
+              Test F1: Local vs Federated
+              {hasBaseline && !hasGlobal && <span className="ml-2 text-xs font-normal text-muted-foreground">(awaiting Phase 2…)</span>}
+              {!hasBaseline && hasGlobal && <span className="ml-2 text-xs font-normal text-muted-foreground">(no Phase 1 baseline)</span>}
+            </h2>
             <div className="rounded-xl border border-border bg-card p-4">
               <LocalGlobalChart rows={rows} />
             </div>
@@ -202,18 +204,10 @@ export default function LocalVsGlobalPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-muted/40">
-                      <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">
-                        Client
-                      </th>
-                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">
-                        Local F1
-                      </th>
-                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">
-                        Global F1
-                      </th>
-                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">
-                        Delta
-                      </th>
+                      <th className="px-4 py-2.5 text-left font-medium text-muted-foreground">Client</th>
+                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">Local F1</th>
+                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">Global F1</th>
+                      <th className="px-4 py-2.5 text-right font-medium text-muted-foreground">Delta</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -222,10 +216,7 @@ export default function LocalVsGlobalPage() {
                       const improved = row.delta > 0.001
                       const hurt = row.delta < -0.001
                       return (
-                        <tr
-                          key={row.clientId}
-                          className={i < rows.length - 1 ? 'border-b border-border' : ''}
-                        >
+                        <tr key={row.clientId} className={i < rows.length - 1 ? 'border-b border-border' : ''}>
                           <td className="px-4 py-2.5 font-medium text-foreground">{row.label}</td>
                           <td className="px-4 py-2.5 text-right font-mono text-foreground">
                             {row.localF1 > 0 ? fmt(row.localF1) : <span className="text-muted-foreground">—</span>}
@@ -237,23 +228,8 @@ export default function LocalVsGlobalPage() {
                             {noData ? (
                               <span className="text-muted-foreground">—</span>
                             ) : (
-                              <span
-                                className={cn(
-                                  'inline-flex items-center justify-end gap-1 font-mono font-semibold',
-                                  improved
-                                    ? 'text-emerald-700 dark:text-emerald-400'
-                                    : hurt
-                                    ? 'text-rose-700 dark:text-rose-400'
-                                    : 'text-muted-foreground'
-                                )}
-                              >
-                                {improved ? (
-                                  <TrendingUp className="h-3.5 w-3.5" aria-hidden="true" />
-                                ) : hurt ? (
-                                  <TrendingDown className="h-3.5 w-3.5" aria-hidden="true" />
-                                ) : (
-                                  <Minus className="h-3.5 w-3.5" aria-hidden="true" />
-                                )}
+                              <span className={cn('inline-flex items-center justify-end gap-1 font-mono font-semibold', improved ? 'text-emerald-700 dark:text-emerald-400' : hurt ? 'text-rose-700 dark:text-rose-400' : 'text-muted-foreground')}>
+                                {improved ? <TrendingUp className="h-3.5 w-3.5" aria-hidden="true" /> : hurt ? <TrendingDown className="h-3.5 w-3.5" aria-hidden="true" /> : <Minus className="h-3.5 w-3.5" aria-hidden="true" />}
                                 {row.delta >= 0 ? '+' : ''}{fmt(row.delta)}
                               </span>
                             )}
