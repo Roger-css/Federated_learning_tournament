@@ -14,7 +14,8 @@ services:
       POSTGRES_DB: fl
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres123
-      
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -30,5 +31,6 @@ services:
       - pgadmin_data:/var/lib/pgadmin
 
 volumes:
+  postgres_data:
   pgadmin_data:
 

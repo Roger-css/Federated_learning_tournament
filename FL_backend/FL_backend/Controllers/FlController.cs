@@ -1,6 +1,8 @@
 using FL_backend.Data;
+using FL_backend.Hubs;
 using FL_backend.Models;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 
 namespace FL_backend.Controllers;
@@ -11,11 +13,32 @@ public class FlController : ControllerBase
 {
     private readonly FLContext _db;
     private readonly ILogger<FlController> _logger;
+    private readonly IHubContext<FlHub> _hubContext;
 
-    public FlController(FLContext db, ILogger<FlController> logger)
+    public FlController(FLContext db, ILogger<FlController> logger, IHubContext<FlHub> hubContext)
     {
         _db = db;
         _logger = logger;
+        _hubContext = hubContext;
+    }
+
+    [HttpGet("local-baseline")]
+    public async Task<IActionResult> GetLocalBaseline()
+    {
+        var data = await _db.FlLocalBaselines
+            .OrderByDescending(r => r.RecordedAt)
+            .Select(r => new
+            {
+                clientId = r.ClientId,
+                trainF1 = r.TrainF1,
+                testF1 = r.TestF1,
+                accuracy = r.Accuracy,
+                numExamples = r.NumExamples,
+                recordedAt = r.RecordedAt,
+            })
+            .ToListAsync();
+
+        return Ok(new { clients = data });
     }
 
     [HttpPost("local-baseline")]
@@ -39,6 +62,17 @@ public class FlController : ControllerBase
             await _db.SaveChangesAsync();
 
             _logger.LogInformation("Saved {Count} local baseline rows.", rows.Count);
+
+            var savedClients = rows.Select(r => new
+            {
+                clientId = r.ClientId,
+                trainF1 = r.TrainF1,
+                testF1 = r.TestF1,
+                accuracy = r.Accuracy,
+                numExamples = r.NumExamples,
+            }).ToList();
+            await _hubContext.Clients.All.SendAsync("LocalBaselineUpdated", savedClients);
+
             return StatusCode(201, new { saved = rows.Count });
         }
         catch (Exception ex)
@@ -46,6 +80,30 @@ public class FlController : ControllerBase
             _logger.LogError(ex, "Failed to save local baseline.");
             return StatusCode(500, new { error = "An internal error occurred." });
         }
+    }
+
+    [HttpGet("rounds")]
+    public async Task<IActionResult> GetRounds()
+    {
+        var data = await _db.FlRounds
+            .Include(r => r.ClientResults)
+            .OrderByDescending(r => r.RoundNumber)
+            .Select(r => new
+            {
+                roundNumber = r.RoundNumber,
+                recordedAt = r.RecordedAt,
+                clients = r.ClientResults.Select(c => new
+                {
+                    clientId = c.ClientId,
+                    trainF1 = c.TrainF1,
+                    testF1 = c.TestF1,
+                    accuracy = c.Accuracy,
+                    numExamples = c.NumExamples,
+                }).ToList(),
+            })
+            .ToListAsync();
+
+        return Ok(new { rounds = data });
     }
 
     [HttpPost("rounds")]
@@ -77,6 +135,21 @@ public class FlController : ControllerBase
 
             _logger.LogInformation("Saved round {RoundNumber} with {Count} client results.",
                 round.RoundNumber, round.ClientResults.Count);
+
+            var savedClientResults = round.ClientResults.Select(c => new
+            {
+                clientId = c.ClientId,
+                trainF1 = c.TrainF1,
+                testF1 = c.TestF1,
+                accuracy = c.Accuracy,
+                numExamples = c.NumExamples,
+            }).ToList();
+            await _hubContext.Clients.All.SendAsync("RoundUpdated", new
+            {
+                roundNumber = request.RoundNumber,
+                clients = savedClientResults
+            });
+
             return StatusCode(201, new { roundId = round.Id, saved = round.ClientResults.Count });
         }
         catch (Exception ex)

@@ -1,4 +1,5 @@
 using FL_backend.Data;
+using FL_backend.Hubs;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -6,6 +7,15 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
+builder.Services.AddSignalR();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("FrontendPolicy", policy =>
+        policy.WithOrigins("http://localhost:3000")
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials());
+});
 
 var connString = builder.Configuration.GetConnectionString("FL_Context")
     ?? throw new InvalidOperationException("Connection string 'FL_Context' not found.");
@@ -16,20 +26,11 @@ var app = builder.Build();
 
 app.Logger.LogInformation("Using connection string: {ConnString}", connString);
 
-// Apply EF migrations automatically on startup (dev only)
+// Ensure database schema exists (idempotent — no-op if already created)
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<FLContext>();
-    try
-    {
-        await db.Database.EnsureCreatedAsync();
-        await db.Database.MigrateAsync();
-        app.Logger.LogInformation("EF migrations applied successfully.");
-    }
-    catch (Exception ex)
-    {
-        app.Logger.LogWarning(ex, "Could not apply EF migrations; database may not be ready.");
-    }
+    await db.Database.EnsureCreatedAsync();
 }
 
 if (app.Environment.IsDevelopment())
@@ -38,7 +39,9 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+app.UseCors("FrontendPolicy");
 app.UseAuthorization();
 app.MapControllers();
+app.MapHub<FlHub>("/hubs/fl");
 
 app.Run();
