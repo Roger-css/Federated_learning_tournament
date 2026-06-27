@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 from typing import Dict
 
@@ -8,6 +9,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import requests
 import numpy as np
 import torch
 
@@ -18,25 +20,86 @@ try:
     from config import (
         ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
         LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
+        SEED,
     )
 except ImportError:
     from pytorchexample.config import (
         ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
         LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
+        SEED,
     )
 
 try:
     from task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        DEVICE, GlobalModel, build_sensor_map, detect_largest_client,
+        detect_weak_client, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
 except ImportError:
     from pytorchexample.task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate,
+        DEVICE, GlobalModel, build_sensor_map, detect_largest_client,
+        detect_weak_client, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
+
+# ---------------------------------------------------------------------------
+# Determinism helpers
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+
+# ---------------------------------------------------------------------------
+# Backend API reporting
+# ---------------------------------------------------------------------------
+
+FL_API_BASE = "http://localhost:8080/api/fl"
+
+def report_local_baseline_to_backend(local_results: dict):
+    payload = {
+        "clients": [
+            {
+                "clientId": cid,
+                "trainF1": r["train_f1"],
+                "testF1": r["test_f1"],
+                "accuracy": r["accuracy"],
+                "numExamples": r["num_examples"],
+            }
+            for cid, r in local_results.items()
+        ]
+    }
+    try:
+        resp = requests.post(f"{FL_API_BASE}/local-baseline", json=payload, timeout=5)
+        resp.raise_for_status()
+        print(f"  [Backend] Local baseline reported successfully (status {resp.status_code})")
+    except requests.exceptions.RequestException as e:
+        print(f"  [Backend] WARNING: failed to report local baseline to backend: {e}")
+
+def report_round_to_backend(round_number: int, round_results: dict):
+    payload = {
+        "roundNumber": round_number,
+        "clients": [
+            {
+                "clientId": cid,
+                "trainF1": r["train_f1"],
+                "testF1": r["test_f1"],
+                "accuracy": r["accuracy"],
+                "numExamples": r["num_examples"],
+            }
+            for cid, r in round_results.items()
+        ]
+    }
+    try:
+        resp = requests.post(f"{FL_API_BASE}/rounds", json=payload, timeout=5)
+        resp.raise_for_status()
+        print(f"  [Backend] Round {round_number} reported successfully (status {resp.status_code})")
+    except requests.exceptions.RequestException as e:
+        print(f"  [Backend] WARNING: failed to report round {round_number} to backend: {e}")
 
 # ---------------------------------------------------------------------------
 # ServerApp entrypoint (for flwr run)
@@ -179,6 +242,8 @@ def write_results(round_metrics, path, local_baseline=None):
 # ---------------------------------------------------------------------------
 
 def main():
+    set_seed(SEED)
+
     print("\n" + "=" * 65)
     print("  DHSV Fault Detection — Two-Phase Federated Learning")
     print("=" * 65)
@@ -213,6 +278,10 @@ def main():
     local_results = {}
     client_loaders = {}
 
+    largest_client_id, largest_size = detect_largest_client(clients_data)
+    print(f"\n  Largest client: {largest_client_id} ({largest_size:,} samples)")
+    print(f"  → extended local training: {int(LOCAL_EPOCHS * 1.5)} epochs")
+
     for client_id in sorted(clients_data.keys()):
         data = clients_data[client_id]
         model = GlobalModel(
@@ -222,9 +291,14 @@ def main():
 
         tr_loader, tr_eval, te_loader, class_w, sensor_mask = prepare_client_data(data, sensor_map)
 
+        client_seed = SEED + sum(ord(c) for c in client_id)
+        set_seed(client_seed)
+
+        epochs = int(LOCAL_EPOCHS * 1.5) if client_id == largest_client_id else LOCAL_EPOCHS
+
         res, _ = train_model(
             model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
-            n_epochs=LOCAL_EPOCHS, lr=LR,
+            n_epochs=epochs, lr=LR,
             client_id=f"{client_id} (Phase 1)",
         )
 
@@ -242,6 +316,30 @@ def main():
     print(f"  {'─'*36}")
     print(f"  {'Avg Test F1':<24} {local_avg_f1:>10.4f}")
     print(f"{'='*65}")
+
+    # -- Detect weak client (most in need of extra FL fine-tuning) ----------
+    weak_client_id, weak_score = detect_weak_client(clients_data, local_results)
+    if weak_client_id is not None:
+        print(f"\n  Weak client detected: {weak_client_id} (need_score={weak_score:.3f})")
+        print(f"  → extended FL training: 30 epochs/round instead of {FL_EPOCHS}")
+    else:
+        print(f"\n  No client scored above weak-client threshold (max need_score={weak_score:.3f})")
+
+    # -- Report local baseline to backend immediately (before Phase 2) -----
+    local_baseline = {}
+    for cid in sorted(local_results.keys()):
+        tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
+        ev = evaluate_detailed(model, te_loader, sensor_mask)
+        r = local_results[cid]
+        local_baseline[cid] = {
+            "test_f1":      float(r["test"]["f1"]),
+            "train_f1":     float(r["train"]["f1"]),
+            "accuracy":     float(ev["accuracy"]),
+            "predictions":  ev["predictions"],
+            "confidences":  ev["confidences"],
+            "num_examples": ev["num_examples"],
+        }
+    report_local_baseline_to_backend(local_baseline)
 
     # =====================================================================
     # Phase 2 — FL rounds (lightweight fine-tuning + aggregation)
@@ -266,9 +364,18 @@ def main():
             if global_weights is not None:
                 model.load_weights(global_weights)
 
+            current_epochs = FL_EPOCHS
+            is_weak = False
+            if weak_client_id is not None and client_id == weak_client_id:
+                current_epochs = 30
+                is_weak = True
+
+            client_seed = SEED + sum(ord(c) for c in client_id) + fl_round
+            set_seed(client_seed)
+
             res, _ = train_model(
                 model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
-                n_epochs=FL_EPOCHS, lr=FL_LR,
+                n_epochs=current_epochs, lr=FL_LR,
                 use_early_stop=False,
                 client_id=f"{client_id} (FL Round {fl_round})",
             )
@@ -283,29 +390,47 @@ def main():
 
         # -- Log round metrics --------------------------------------------
         fit_metrics = {}
+        eval_metrics = {}
         for cid, res in round_results.items():
             fit_metrics[cid] = {
                 "train_f1": float(res["train"]["f1"]),
                 "test_f1":  float(res["test"]["f1"]),
             }
+            tr_loader, tr_eval, te_loader, class_w, sensor_mask, model = client_loaders[cid]
+            ev = evaluate_detailed(model, te_loader, sensor_mask)
+            eval_metrics[cid] = ev
 
         avg_f1 = np.mean([v["test"]["f1"] for v in round_results.values()])
-        improvement = avg_f1 - local_avg_f1
 
         print(f"\n{'='*65}")
         print(f"  FL Round {fl_round}/{NUM_ROUNDS} — Results")
-        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10}")
-        print(f"  {'─'*36}")
-        for cid, m in sorted(fit_metrics.items()):
-            print(f"  {cid:<14} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f}")
-        print(f"  {'─'*36}")
-        print(f"  {'Avg Test F1':<24} {avg_f1:>10.4f}   vs local: {improvement:+.4f}")
+        print(f"  {'Client':<14} {'Train F1':>10} {'Test F1':>10} {'Accuracy':>10} {'Samples':>8} {'Preds':>6} {'Confs':>6}")
+        print(f"  {'─'*66}")
+        for cid in sorted(fit_metrics.keys()):
+            fm = fit_metrics[cid]
+            em = eval_metrics[cid]
+            print(f"  {cid:<14} {fm['train_f1']:>10.4f} {fm['test_f1']:>10.4f} {em['accuracy']:>10.4f} {em['num_examples']:>8} {len(em['predictions']):>6} {len(em['confidences']):>6}")
+        print(f"  {'─'*66}")
+        print(f"  {'Avg test F1':<24} {avg_f1:>10.4f}")
         print(f"{'='*65}")
+
+        # Build merged per-client dict for backend reporting (no predictions/confidences)
+        round_report = {}
+        for cid in sorted(fit_metrics.keys()):
+            fm = fit_metrics[cid]
+            em = eval_metrics[cid]
+            round_report[cid] = {
+                "train_f1": fm["train_f1"],
+                "test_f1": em["test_f1"],
+                "accuracy": em["accuracy"],
+                "num_examples": em["num_examples"],
+            }
+        report_round_to_backend(fl_round, round_report)
 
         round_metrics.append({
             "round": fl_round,
             "fit": fit_metrics,
-            "evaluate": {},
+            "evaluate": eval_metrics,
         })
 
     # =====================================================================
@@ -332,16 +457,6 @@ def main():
     print(f"  {'─'*54}")
     print(f"  {'Average':<14} {total_local/n:>14.4f} {total_fl/n:>14.4f} {(total_fl-total_local)/n:>+10.4f}")
     print(f"{'#'*65}")
-
-    # -- Build local baseline for results JSON ----------------------------
-    local_baseline = {}
-    for cid in sorted(local_results.keys()):
-        r = local_results[cid]
-        local_baseline[cid] = {
-            "test_f1": r["test"]["f1"],
-            "train_f1": r["train"]["f1"],
-            "accuracy": r["test"]["accuracy"],
-        }
 
     write_results(round_metrics, RESULTS_PATH, local_baseline=local_baseline)
 
