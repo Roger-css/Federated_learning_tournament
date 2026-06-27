@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 from typing import Dict
 
@@ -19,25 +20,39 @@ try:
     from config import (
         ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
         LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
+        SEED,
     )
 except ImportError:
     from pytorchexample.config import (
         ALPHA, CLIENT_MAP, DATA_DIR, D_MODEL, FL_EPOCHS, FL_LR,
         LOCAL_EPOCHS, LR, N_HEADS, N_LAYERS, NUM_ROUNDS, RESULTS_PATH,
+        SEED,
     )
 
 try:
     from task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate, evaluate_detailed,
+        DEVICE, GlobalModel, build_sensor_map, detect_largest_client,
+        detect_weak_client, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
 except ImportError:
     from pytorchexample.task import (
-        DEVICE, GlobalModel, build_sensor_map, evaluate, evaluate_detailed,
+        DEVICE, GlobalModel, build_sensor_map, detect_largest_client,
+        detect_weak_client, evaluate, evaluate_detailed,
         fedavg_global_equal_stable, load_all_clients_data, load_client_data,
         prepare_client_data, train_model,
     )
+
+# ---------------------------------------------------------------------------
+# Determinism helpers
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
 # ---------------------------------------------------------------------------
 # Backend API reporting
@@ -227,6 +242,8 @@ def write_results(round_metrics, path, local_baseline=None):
 # ---------------------------------------------------------------------------
 
 def main():
+    set_seed(SEED)
+
     print("\n" + "=" * 65)
     print("  DHSV Fault Detection — Two-Phase Federated Learning")
     print("=" * 65)
@@ -261,6 +278,10 @@ def main():
     local_results = {}
     client_loaders = {}
 
+    largest_client_id, largest_size = detect_largest_client(clients_data)
+    print(f"\n  Largest client: {largest_client_id} ({largest_size:,} samples)")
+    print(f"  → extended local training: {int(LOCAL_EPOCHS * 1.5)} epochs")
+
     for client_id in sorted(clients_data.keys()):
         data = clients_data[client_id]
         model = GlobalModel(
@@ -270,9 +291,14 @@ def main():
 
         tr_loader, tr_eval, te_loader, class_w, sensor_mask = prepare_client_data(data, sensor_map)
 
+        client_seed = SEED + sum(ord(c) for c in client_id)
+        set_seed(client_seed)
+
+        epochs = int(LOCAL_EPOCHS * 1.5) if client_id == largest_client_id else LOCAL_EPOCHS
+
         res, _ = train_model(
             model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
-            n_epochs=LOCAL_EPOCHS, lr=LR,
+            n_epochs=epochs, lr=LR,
             client_id=f"{client_id} (Phase 1)",
         )
 
@@ -290,6 +316,14 @@ def main():
     print(f"  {'─'*36}")
     print(f"  {'Avg Test F1':<24} {local_avg_f1:>10.4f}")
     print(f"{'='*65}")
+
+    # -- Detect weak client (most in need of extra FL fine-tuning) ----------
+    weak_client_id, weak_score = detect_weak_client(clients_data, local_results)
+    if weak_client_id is not None:
+        print(f"\n  Weak client detected: {weak_client_id} (need_score={weak_score:.3f})")
+        print(f"  → extended FL training: 30 epochs/round instead of {FL_EPOCHS}")
+    else:
+        print(f"\n  No client scored above weak-client threshold (max need_score={weak_score:.3f})")
 
     # -- Report local baseline to backend immediately (before Phase 2) -----
     local_baseline = {}
@@ -330,9 +364,18 @@ def main():
             if global_weights is not None:
                 model.load_weights(global_weights)
 
+            current_epochs = FL_EPOCHS
+            is_weak = False
+            if weak_client_id is not None and client_id == weak_client_id:
+                current_epochs = 30
+                is_weak = True
+
+            client_seed = SEED + sum(ord(c) for c in client_id) + fl_round
+            set_seed(client_seed)
+
             res, _ = train_model(
                 model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
-                n_epochs=FL_EPOCHS, lr=FL_LR,
+                n_epochs=current_epochs, lr=FL_LR,
                 use_early_stop=False,
                 client_id=f"{client_id} (FL Round {fl_round})",
             )

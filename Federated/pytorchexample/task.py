@@ -62,7 +62,7 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, label_smoothing=0.05):
+    def __init__(self, gamma=2.0, label_smoothing=0.1):
         super().__init__()
         self.gamma           = gamma
         self.label_smoothing = label_smoothing
@@ -283,7 +283,7 @@ def train_model(model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
                 n_epochs, lr, use_early_stop=True, client_id=""):
     model.to(DEVICE)
     sensor_mask = sensor_mask.to(DEVICE) if sensor_mask is not None else None
-    criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
+    criterion = FocalLoss(gamma=2.0, label_smoothing=0.1)
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
                                   patience=8, min_lr=1e-6)
@@ -346,6 +346,55 @@ def train_model(model, tr_loader, tr_eval, te_loader, class_w, sensor_mask,
         target_names=CLASS_NAMES, zero_division=0,
     ))
     return best_res, history
+
+# ---------------------------------------------------------------------------
+# detect_largest_client
+# ---------------------------------------------------------------------------
+
+def detect_largest_client(clients_data: dict):
+    """Returns (client_id, sample_count) of the client with the most training data."""
+    max_size = 0
+    largest_client = None
+    for client_id in clients_data.keys():
+        data_size = len(clients_data[client_id]['X_train'])
+        if data_size > max_size:
+            max_size = data_size
+            largest_client = client_id
+    return largest_client, max_size
+
+# ---------------------------------------------------------------------------
+# detect_weak_client
+# ---------------------------------------------------------------------------
+
+def detect_weak_client(clients_data: dict, local_results: dict):
+    """
+    Scores each client by combined data-scarcity + poor local performance.
+    Returns (client_id, score) if a client clearly needs extra help, else (None, score).
+    """
+    scores = {}
+    max_size = max(len(clients_data[c]['X_train']) for c in clients_data)
+
+    for client_id in clients_data.keys():
+        data_size = len(clients_data[client_id]['X_train'])
+        client_f1 = local_results[client_id]['test']['f1']
+
+        normalized_size = 1.0 - (data_size / max_size if max_size > 0 else 0)
+        normalized_f1   = 1.0 - client_f1
+
+        need_score = (normalized_size * 0.6) + (normalized_f1 * 0.4)
+        scores[client_id] = need_score
+
+    print(f"\n  Weak-client need scores:")
+    for cid, score in sorted(scores.items(), key=lambda x: -x[1]):
+        print(f"    {cid}: need_score={score:.3f}")
+
+    weak_client = max(scores, key=scores.get)
+    weak_score  = scores[weak_client]
+
+    if weak_score > 0.5:
+        return weak_client, weak_score
+    else:
+        return None, weak_score
 
 # ---------------------------------------------------------------------------
 # evaluate
