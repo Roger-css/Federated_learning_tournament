@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: FL_backend/Dockerfile
+    ports:
+      - 8080:8080
+      - 8081:8081
     depends_on:
       - postgres
   postgres:
@@ -14,8 +17,6 @@ services:
       POSTGRES_DB: fl
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres123
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -33,4 +34,3 @@ services:
 volumes:
   postgres_data:
   pgadmin_data:
-
